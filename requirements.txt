@@ -1,0 +1,9 @@
+runpod>=1.7.0
+# Qwen3-ASR is supported natively in transformers from v5.13.0 onward.
+transformers>=5.13.0
+accelerate>=1.1.0
+torchaudio
+librosa>=0.10.1
+soundfile>=0.12.1
+huggingface_hub>=0.25
+requests>=2.31

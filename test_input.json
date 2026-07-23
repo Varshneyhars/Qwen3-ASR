@@ -1,0 +1,9 @@
+{
+  "input": {
+    "audio_url": "https://huggingface.co/datasets/bezzam/audio_samples/resolve/main/librispeech_mr_quilter.wav",
+    "prompt": "Vocabulary: Quilter, apostle, gospel.",
+    "language": "English",
+    "timestamps": true,
+    "response_format": "verbose_json"
+  }
+}

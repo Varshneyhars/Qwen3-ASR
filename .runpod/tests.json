@@ -1,0 +1,95 @@
+{
+  "tests": [
+    {
+      "name": "basic_transcription_autodetect",
+      "input": {
+        "audio_url": "https://huggingface.co/datasets/bezzam/audio_samples/resolve/main/librispeech_mr_quilter.wav",
+        "response_format": "text"
+      },
+      "timeout": 300000
+    },
+    {
+      "name": "context_biasing_prompt",
+      "input": {
+        "audio_url": "https://huggingface.co/datasets/bezzam/audio_samples/resolve/main/librispeech_mr_quilter.wav",
+        "prompt": "Vocabulary: Quilter, apostle, gospel.",
+        "response_format": "text"
+      },
+      "timeout": 180000
+    },
+    {
+      "name": "context_biasing_word_list",
+      "input": {
+        "audio_url": "https://huggingface.co/datasets/bezzam/audio_samples/resolve/main/librispeech_mr_quilter.wav",
+        "prompt": ["Quilter", "apostle", "gospel"],
+        "response_format": "text"
+      },
+      "timeout": 180000
+    },
+    {
+      "name": "forced_language_chinese",
+      "input": {
+        "audio_url": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-ASR-Repo/asr_zh.wav",
+        "language": "Chinese",
+        "response_format": "text"
+      },
+      "timeout": 180000
+    },
+    {
+      "name": "word_and_segment_timestamps",
+      "input": {
+        "audio_url": "https://huggingface.co/datasets/bezzam/audio_samples/resolve/main/librispeech_mr_quilter.wav",
+        "timestamps": true,
+        "response_format": "verbose_json"
+      },
+      "timeout": 300000
+    },
+    {
+      "name": "srt_subtitles",
+      "input": {
+        "audio_url": "https://huggingface.co/datasets/bezzam/audio_samples/resolve/main/librispeech_mr_quilter.wav",
+        "response_format": "srt"
+      },
+      "timeout": 240000
+    },
+    {
+      "name": "batch_multilingual",
+      "input": {
+        "audio": [
+          { "audio_url": "https://huggingface.co/datasets/bezzam/audio_samples/resolve/main/librispeech_mr_quilter.wav" },
+          { "audio_url": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-ASR-Repo/asr_zh.wav" }
+        ],
+        "response_format": "text"
+      },
+      "timeout": 300000
+    },
+    {
+      "name": "validation_rejects_missing_audio",
+      "input": {
+        "response_format": "text"
+      },
+      "timeout": 30000
+    }
+  ],
+  "config": {
+    "gpuTypeId": "NVIDIA GeForce RTX 4090",
+    "gpuCount": 1,
+    "env": [
+      {
+        "key": "QWEN_ENABLE_ALIGNER",
+        "value": "true"
+      },
+      {
+        "key": "QWEN_PRECISION",
+        "value": "bfloat16"
+      }
+    ],
+    "allowedCudaVersions": [
+      "13.0",
+      "12.9",
+      "12.8",
+      "12.7",
+      "12.6"
+    ]
+  }
+}

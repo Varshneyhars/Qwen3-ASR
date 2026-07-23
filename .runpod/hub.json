@@ -1,0 +1,218 @@
+{
+  "title": "Qwen3 ASR",
+  "description": "Multilingual speech recognition with Qwen3-ASR-1.7B. Transcribes 30 languages plus 22 Chinese dialects with automatic language identification, and supports context biasing — pass domain vocabulary, names, or jargon via `prompt` and the model biases recognition toward them. Optional word and segment timestamps via the Qwen3 forced aligner, with SRT and WebVTT output. Accepts audio by URL, base64, or data URI in any format ffmpeg can decode.",
+  "type": "serverless",
+  "category": "audio",
+  "iconUrl": "https://upload.wikimedia.org/wikipedia/commons/thumb/6/69/Qwen_logo.svg/500px-Qwen_logo.svg.png",
+  "config": {
+    "runsOn": "GPU",
+    "gpuCount": 1,
+    "containerDiskInGb": 30,
+    "allowedCudaVersions": [
+      "13.0",
+      "12.9",
+      "12.8",
+      "12.7",
+      "12.6"
+    ],
+    "presets": [
+      {
+        "name": "Balanced (default)",
+        "defaults": {
+          "QWEN_MODEL_ID": "Qwen/Qwen3-ASR-1.7B-hf",
+          "QWEN_PRECISION": "bfloat16",
+          "QWEN_ENABLE_ALIGNER": "true",
+          "QWEN_MAX_NEW_TOKENS": 448
+        }
+      },
+      {
+        "name": "Fast (no timestamps)",
+        "defaults": {
+          "QWEN_MODEL_ID": "Qwen/Qwen3-ASR-1.7B-hf",
+          "QWEN_PRECISION": "bfloat16",
+          "QWEN_ENABLE_ALIGNER": "false",
+          "QWEN_MAX_NEW_TOKENS": 448
+        }
+      },
+      {
+        "name": "Lightweight (0.6B)",
+        "defaults": {
+          "QWEN_MODEL_ID": "Qwen/Qwen3-ASR-0.6B-hf",
+          "QWEN_PRECISION": "bfloat16",
+          "QWEN_ENABLE_ALIGNER": "false",
+          "QWEN_MAX_NEW_TOKENS": 448
+        }
+      },
+      {
+        "name": "Long-form audio",
+        "defaults": {
+          "QWEN_MODEL_ID": "Qwen/Qwen3-ASR-1.7B-hf",
+          "QWEN_PRECISION": "bfloat16",
+          "QWEN_ENABLE_ALIGNER": "true",
+          "QWEN_MAX_NEW_TOKENS": 1024,
+          "QWEN_CHUNK_LENGTH_S": 240,
+          "QWEN_CHUNK_OVERLAP_S": 10
+        }
+      }
+    ],
+    "env": [
+      {
+        "key": "QWEN_MODEL_ID",
+        "input": {
+          "name": "ASR model",
+          "type": "string",
+          "description": "Hugging Face repo for the speech recognition model. The 0.6B variant is roughly a third the size with lower accuracy.",
+          "options": [
+            { "label": "Qwen3-ASR-1.7B (recommended)", "value": "Qwen/Qwen3-ASR-1.7B-hf" },
+            { "label": "Qwen3-ASR-0.6B (smaller, faster)", "value": "Qwen/Qwen3-ASR-0.6B-hf" }
+          ],
+          "default": "Qwen/Qwen3-ASR-1.7B-hf"
+        }
+      },
+      {
+        "key": "QWEN_PRECISION",
+        "input": {
+          "name": "Precision",
+          "type": "string",
+          "description": "bfloat16 is the model's native dtype and the right default. float32 doubles memory for no accuracy gain.",
+          "options": [
+            { "label": "bfloat16 (recommended)", "value": "bfloat16" },
+            { "label": "float16", "value": "float16" },
+            { "label": "float32", "value": "float32" }
+          ],
+          "default": "bfloat16"
+        }
+      },
+      {
+        "key": "QWEN_ENABLE_ALIGNER",
+        "input": {
+          "name": "Enable word timestamps",
+          "type": "boolean",
+          "description": "Loads the Qwen3 forced aligner (~1.8 GB) so requests can return word and segment timings, SRT, and WebVTT. Turn off to save VRAM if you only need plain text.",
+          "trueValue": "true",
+          "falseValue": "false",
+          "default": true
+        }
+      },
+      {
+        "key": "QWEN_MAX_NEW_TOKENS",
+        "input": {
+          "name": "Max new tokens",
+          "type": "number",
+          "description": "Generation cap per audio window. Raise if transcripts of dense speech come back truncated.",
+          "min": 64,
+          "max": 4096,
+          "default": 448
+        }
+      },
+      {
+        "key": "QWEN_CHUNK_THRESHOLD_S",
+        "input": {
+          "name": "Chunking threshold (seconds)",
+          "type": "number",
+          "description": "Audio longer than this is split into overlapping windows. Qwen3-ASR handles about 5 minutes per forward pass, so keep this under 300.",
+          "min": 30,
+          "max": 300,
+          "default": 280,
+          "advanced": true
+        }
+      },
+      {
+        "key": "QWEN_CHUNK_LENGTH_S",
+        "input": {
+          "name": "Chunk length (seconds)",
+          "type": "number",
+          "description": "Window length used when chunking long audio.",
+          "min": 30,
+          "max": 300,
+          "default": 240,
+          "advanced": true
+        }
+      },
+      {
+        "key": "QWEN_CHUNK_OVERLAP_S",
+        "input": {
+          "name": "Chunk overlap (seconds)",
+          "type": "number",
+          "description": "Overlap between windows. Larger values reduce clipped words at boundaries at the cost of extra compute.",
+          "min": 0,
+          "max": 60,
+          "default": 5,
+          "advanced": true
+        }
+      },
+      {
+        "key": "QWEN_MAX_AUDIO_DURATION_S",
+        "input": {
+          "name": "Max audio duration (seconds)",
+          "type": "number",
+          "description": "Requests with audio longer than this are rejected. Default is 4 hours.",
+          "min": 60,
+          "max": 28800,
+          "default": 14400,
+          "advanced": true
+        }
+      },
+      {
+        "key": "QWEN_MAX_BATCH_ITEMS",
+        "input": {
+          "name": "Max batch items",
+          "type": "number",
+          "description": "Maximum number of audio items accepted in a single batch request.",
+          "min": 1,
+          "max": 128,
+          "default": 32,
+          "advanced": true
+        }
+      },
+      {
+        "key": "QWEN_MAX_DOWNLOAD_BYTES",
+        "input": {
+          "name": "Max download size (bytes)",
+          "type": "number",
+          "description": "Upper bound on fetched or decoded audio. Default is 512 MB.",
+          "min": 1048576,
+          "max": 2147483648,
+          "default": 536870912,
+          "advanced": true
+        }
+      },
+      {
+        "key": "QWEN_BLOCK_PRIVATE_URLS",
+        "input": {
+          "name": "Block private URLs (SSRF guard)",
+          "type": "boolean",
+          "description": "Rejects audio URLs resolving to private, loopback, or link-local addresses. Only disable if you deliberately fetch from a VPC-internal host.",
+          "trueValue": "true",
+          "falseValue": "false",
+          "default": true,
+          "advanced": true
+        }
+      },
+      {
+        "key": "QWEN_SEGMENT_MAX_CHARS",
+        "input": {
+          "name": "Subtitle cue max characters",
+          "type": "number",
+          "description": "Maximum characters per SRT/WebVTT cue before it is split.",
+          "min": 20,
+          "max": 250,
+          "default": 84,
+          "advanced": true
+        }
+      },
+      {
+        "key": "QWEN_SEGMENT_MAX_DURATION_S",
+        "input": {
+          "name": "Subtitle cue max duration (seconds)",
+          "type": "number",
+          "description": "Maximum seconds per SRT/WebVTT cue before it is split.",
+          "min": 1,
+          "max": 30,
+          "default": 6,
+          "advanced": true
+        }
+      }
+    ]
+  }
+}

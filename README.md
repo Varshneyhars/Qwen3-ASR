@@ -1,5 +1,7 @@
 # Qwen3-ASR on RunPod Serverless
 
+[![Runpod](https://api.runpod.io/badge/Varshneyhars/Qwen3-ASR)](https://console.runpod.io/hub/Varshneyhars/Qwen3-ASR)
+
 Production-ready serverless deployment of [Qwen/Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B-hf) — Alibaba's open-source multilingual speech recognition model (1.7 B params, 30 languages + 22 Chinese dialects) — as a RunPod Serverless endpoint.
 
 Call it like any HTTP API: send an audio URL or base64 clip, get back a transcript with the detected language, optional word timestamps, or subtitles.
@@ -25,6 +27,8 @@ Call it like any HTTP API: send an audio URL or base64 clip, get back a transcri
 | [test_input.json](test_input.json) | Sample payload for local testing |
 | [client_example.py](client_example.py) | Python client for `/runsync` and `/run` endpoints |
 | [API.md](API.md) | Full integration guide — all languages, error handling, cost |
+| [.runpod/hub.json](.runpod/hub.json) | RunPod Hub listing: presets, configurable env vars |
+| [.runpod/tests.json](.runpod/tests.json) | Hub CI tests run on every release |
 | [.dockerignore](.dockerignore) / [.gitignore](.gitignore) | Build and VCS hygiene |
 
 ## Why the `-hf` variant

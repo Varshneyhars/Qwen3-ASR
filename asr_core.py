@@ -42,6 +42,12 @@ MAX_AUDIO_DURATION_S = float(os.environ.get("QWEN_MAX_AUDIO_DURATION_S", "14400"
 MAX_DOWNLOAD_BYTES = int(os.environ.get("QWEN_MAX_DOWNLOAD_BYTES", str(512 * 1024 * 1024)))
 DOWNLOAD_TIMEOUT_S = float(os.environ.get("QWEN_DOWNLOAD_TIMEOUT_S", "120"))
 MAX_BATCH_ITEMS = int(os.environ.get("QWEN_MAX_BATCH_ITEMS", "32"))
+
+# How many clips share a single GPU forward pass. Running one clip at a time
+# leaves a 1.7B model badly under-occupying an L4 — the GPU spends most of its
+# time waiting on memory rather than computing. Feeding several at once is the
+# single biggest throughput lever for short audio. Set to 1 to disable.
+GPU_BATCH_SIZE = int(os.environ.get("QWEN_GPU_BATCH_SIZE", "8"))
 BLOCK_PRIVATE_URLS = os.environ.get("QWEN_BLOCK_PRIVATE_URLS", "true").lower() == "true"
 
 # Scratch space for downloads and transcoded WAVs. On Cloud Run /tmp is a
@@ -785,6 +791,127 @@ def _transcribe_one(source: str, req: Dict[str, Any], idx: int) -> Dict[str, Any
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+def _finish_item(res: Dict[str, Any], duration: float, kind: str, nbytes: int,
+                 fetch_s: float, infer_s: float, strategy: str,
+                 req: Dict[str, Any]) -> Dict[str, Any]:
+    """Common tail: segments, duration, output shaping, metrics."""
+    res["segments"] = _words_to_segments(res.get("words") or [])
+    res["duration"] = round(duration, 3)
+    out = _shape(res, req["response_format"])
+    out["metrics"] = {
+        "audio_seconds": round(duration, 3),
+        "fetch_seconds": round(fetch_s, 3),
+        "inference_seconds": round(infer_s, 3),
+        "realtime_factor": round(duration / infer_s, 1) if infer_s > 0 else None,
+        "strategy": strategy,
+        "source_kind": kind,
+        "input_bytes": nbytes,
+        "prompt_used": bool(req["prompt"]),
+        "language_forced": bool(req["language"]),
+    }
+    return out
+
+
+def _transcribe_grouped(req: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Transcribe many inputs, sharing GPU forward passes between them.
+
+    Short clips are fetched, sorted by duration, then pushed through the model
+    in groups of GPU_BATCH_SIZE. Sorting matters: the processor pads every item
+    in a group to the longest one, so mixing a 5s and a 300s clip would waste
+    most of the batch on padding.
+
+    Long audio still goes one at a time — it is windowed internally and already
+    keeps the GPU busy.
+    """
+    workdir = tempfile.mkdtemp(prefix="qwen-asr-batch-", dir=WORK_ROOT)
+    n = len(req["sources"])
+    results: List[Optional[Dict[str, Any]]] = [None] * n
+    ready: List[Dict[str, Any]] = []
+
+    try:
+        # ---- fetch + normalize everything first ----
+        for i, source in enumerate(req["sources"]):
+            t0 = time.perf_counter()
+            try:
+                wav, duration, kind, nbytes = _materialize_audio(source, workdir, i)
+                ready.append({"idx": i, "wav": wav, "duration": duration, "kind": kind,
+                              "nbytes": nbytes, "fetch_s": time.perf_counter() - t0})
+            except InputError as e:
+                results[i] = {"error": str(e), "index": i}
+            except Exception as e:
+                print(f"[error] item {i}: {type(e).__name__}: {e}")
+                results[i] = {"error": f"{type(e).__name__}: {e}", "index": i}
+
+        short = [r for r in ready if r["duration"] <= CHUNK_THRESHOLD_S]
+        long_ = [r for r in ready if r["duration"] > CHUNK_THRESHOLD_S]
+
+        # ---- short clips: real GPU batching ----
+        short.sort(key=lambda r: r["duration"])
+        for start in range(0, len(short), GPU_BATCH_SIZE):
+            group = short[start:start + GPU_BATCH_SIZE]
+            t1 = time.perf_counter()
+            try:
+                outs = _transcribe_batch([g["wav"] for g in group], req["language"],
+                                         req["prompt"], req["max_new_tokens"])
+            except Exception as e:
+                print(f"[batch] group failed ({type(e).__name__}: {e}); retrying individually")
+                outs = None
+            if outs is None or len(outs) != len(group):
+                # A batched pass can fail on a single malformed item. Falling back
+                # one-by-one costs speed but saves the whole group's results.
+                outs = []
+                for g in group:
+                    try:
+                        outs.append(_transcribe_batch([g["wav"]], req["language"],
+                                                      req["prompt"], req["max_new_tokens"])[0])
+                    except Exception as e:
+                        outs.append({"language": None, "text": "", "_err": f"{type(e).__name__}: {e}"})
+            # Charge each item an equal share of the group's GPU time.
+            per_item = (time.perf_counter() - t1) / max(1, len(group))
+
+            for g, res in zip(group, outs):
+                if res.get("_err"):
+                    results[g["idx"]] = {"error": res["_err"], "index": g["idx"]}
+                    continue
+                if req["timestamps"]:
+                    res["words"] = _align_words(g["wav"], res["text"], res["language"])
+                results[g["idx"]] = _finish_item(
+                    res, g["duration"], g["kind"], g["nbytes"], g["fetch_s"],
+                    per_item, f"gpu_batch_{len(group)}", req)
+
+        # ---- long audio: windowed, one at a time ----
+        for g in long_:
+            t1 = time.perf_counter()
+            try:
+                chunks = _split_chunks(g["wav"], workdir)
+                parts = []
+                for chunk_path, offset in chunks:
+                    r = _transcribe_batch([chunk_path], req["language"], req["prompt"],
+                                          req["max_new_tokens"])[0]
+                    if req["timestamps"]:
+                        r["words"] = _align_words(chunk_path, r["text"], r["language"], offset)
+                    parts.append(r)
+                    try:
+                        os.unlink(chunk_path)
+                    except OSError:
+                        pass
+                res = _merge_chunks(parts)
+                results[g["idx"]] = _finish_item(
+                    res, g["duration"], g["kind"], g["nbytes"], g["fetch_s"],
+                    time.perf_counter() - t1, "chunked", req)
+            except Exception as e:
+                print(f"[error] item {g['idx']}: {type(e).__name__}: {e}")
+                results[g["idx"]] = {"error": f"{type(e).__name__}: {e}", "index": g["idx"]}
+
+        # Defensive: nothing may come back as None, or the caller sees a null.
+        for i in range(n):
+            if results[i] is None:
+                results[i] = {"error": "internal: item produced no result", "index": i}
+        return results  # type: ignore[return-value]
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
 def transcribe(inp: Dict[str, Any]) -> Dict[str, Any]:
     """Transcribe one or more audio inputs.
 
@@ -829,15 +956,19 @@ def transcribe(inp: Dict[str, Any]) -> Dict[str, Any]:
         return {"error": f"Model failed to load: {type(e).__name__}: {e}"}
 
     results: List[Dict[str, Any]] = []
-    for i, source in enumerate(req["sources"]):
-        try:
-            results.append(_transcribe_one(source, req, i))
-        except InputError as e:
-            results.append({"error": str(e), "index": i})
-        except Exception as e:
-            # One bad item must not kill the rest of the batch.
-            print(f"[error] item {i}: {type(e).__name__}: {e}")
-            results.append({"error": f"{type(e).__name__}: {e}", "index": i})
+    if len(req["sources"]) > 1 and GPU_BATCH_SIZE > 1:
+        # Multiple inputs: share GPU forward passes between them.
+        results = _transcribe_grouped(req)
+    else:
+        for i, source in enumerate(req["sources"]):
+            try:
+                results.append(_transcribe_one(source, req, i))
+            except InputError as e:
+                results.append({"error": str(e), "index": i})
+            except Exception as e:
+                # One bad item must not kill the rest of the batch.
+                print(f"[error] item {i}: {type(e).__name__}: {e}")
+                results.append({"error": f"{type(e).__name__}: {e}", "index": i})
 
     total_s = round(time.perf_counter() - started, 3)
 

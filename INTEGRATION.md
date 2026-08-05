@@ -14,7 +14,7 @@ Speech-to-text service running on Google Cloud Run. Send audio, get back a trans
 | **Model** | Qwen3-ASR-1.7B + Qwen3-ForcedAligner-0.6B |
 | **Hardware** | 1× NVIDIA L4 GPU, 8 vCPU, 32 GiB |
 | **Max request duration** | 3600s (Cloud Run hard limit) |
-| **Concurrency** | 1 request per instance, autoscales 0 → 3 |
+| **Concurrency** | 3 requests per instance, autoscales 0 → 3 instances (**9 in flight max**) |
 
 The service scales to zero when idle, so **the first request after a quiet period takes 60–90 seconds** while a GPU instance starts. Subsequent requests are fast. Build retries and generous timeouts around this — it is expected behavior, not a fault.
 
@@ -164,9 +164,9 @@ The bucket must grant `roles/storage.objectViewer` to `qwen3-asr-sa@foundary-gcp
 | --- | --- |
 | **Cold start** | First request after idle takes 60–90s. Set client timeouts ≥ 120s. Show a progress state; don't fail at 30s. |
 | **Long audio** | Anything past ~45 min exceeds the 3600s cap. Queue those as background jobs rather than blocking an HTTP response. |
-| **Concurrency** | Only 3 requests process at once. Beyond that they queue. Add a job queue if your traffic is bursty. |
+| **Concurrency** | Up to 9 requests process at once (3 instances × 3 each). Beyond that they queue. Add a job queue if your traffic is bursty. |
 | **Retries** | Retry `429`/`503`/network with backoff. Never retry `400` — it re-bills for the same rejection. |
-| **User-facing latency** | Even warm, a 5-minute recording takes ~50s. Use a job + polling pattern rather than a synchronous request for anything long. |
+| **User-facing latency** | Warm, a 5-minute recording takes ~35–60s as a single file. Use a job + polling pattern rather than blocking an HTTP response for anything long. |
 
 ---
 
@@ -261,7 +261,11 @@ Any audio format ffmpeg can decode is accepted — mp3, m4a, wav, ogg, opus, web
 
 ## Batch mode
 
-**Use this for volume.** Batching amortizes the cold start and connection setup across many files. For short clips it is roughly **20× cheaper** than one request per file.
+**Use this for volume — it is dramatically faster, not just cheaper.**
+
+Items in one request are fed through the GPU together in a *single forward pass*, not one at a time. That is a fundamentally different execution path from sending files individually: measured **11× faster** for 32 short clips (141s → 12.8s), on top of amortizing cold start and connection setup.
+
+Sending files one per request forfeits this entirely.
 
 ```json
 {
@@ -291,7 +295,8 @@ Response:
 
 Guidance:
 
-- Keep batches at 32. Larger gains nothing (per-file cost is linear) and increases how much you must retry on failure.
+- **Always fill the batch to 32.** Throughput scales strongly with batch size because the whole group shares one GPU pass — measured 23.1s at 8 items, 17.2s at 16, **12.8s at 32**. Half-full batches waste the GPU.
+- **Group clips of similar length.** Every item is padded to the longest in its group, so mixing a 5s clip with a 5-minute one wastes most of the pass. The server sorts by duration internally, but batching similar files together helps further.
 - Keep total audio per batch under ~30 minutes to stay well inside the 3600s timeout.
 - Send batches back-to-back so the instance stays warm.
 
@@ -404,8 +409,12 @@ Retry `429`, `503`, and network errors with exponential backoff. Never retry `40
 | Max audio duration | 4 hours | But see the timeout below — practical ceiling is lower. |
 | Max request duration | 3600s | Cloud Run hard limit. ~45 min of audio at observed speed. |
 | Max upload / download | 512 MB | Per audio file. |
-| Batch items | 32 | Per request. |
-| Concurrent requests | 3 | Equals max instances. Excess queues. |
+| Batch items | 32 | Per request. Also the GPU batch size — fill it. |
+| Concurrent requests | **9** | 3 instances × 3 per instance. Excess queues. |
+
+**9 total = 3 instances × 3 per instance.** Keep the two numbers distinct: 9 is the safe *fleet-wide* figure; the per-GPU limit is 3.
+
+Per-GPU concurrency is 3 deliberately. Measured on a single GPU: 42× realtime at 1 concurrent request, **91× at 3**, 94× at 6 (no meaningful gain), and from **9 concurrent requests on one GPU** onward, requests begin failing and dropping clips. 3 is the plateau — which is why the fleet is 3 instances each serving 3, rather than one instance serving 9.
 
 Audio longer than ~4.5 minutes is automatically split into overlapping windows and stitched back together — transparent to the caller, reported as `metrics.strategy: "chunked"`.
 
@@ -418,12 +427,52 @@ Measured on this deployment:
 | Workload | Throughput |
 | --- | --- |
 | Single file, warm | **5–9× realtime** (60s audio ≈ 8.6s) |
-| Batch of 32 × 20s clips | **6.1× realtime** (640s audio ≈ 105s) |
+| Batch of 32 × 20s clips | **50× realtime** (640s audio ≈ 12.8s) |
+| Same, 3 concurrent batches on one GPU | **~91× realtime** aggregate |
 | Cold start | 60–90s before the first response |
+
+Batch throughput is roughly **20× higher than single-file** throughput. If you are processing more than a handful of files, batching is the single most important thing you can do.
+
+Measured with uniform 20s clips. Real audio of varied length batches less perfectly — the processor pads each group to its longest member — so expect somewhat lower figures in practice.
 
 Word timestamps add roughly 0.1s per minute of audio — effectively free.
 
 The model is autoregressive, so it is slower than CTC models like Whisper-tiny or Parakeet. The trade is context biasing, language identification, and 52 languages/dialects.
+
+### Real production run
+
+A completed bulk job, for planning purposes:
+
+| | |
+| --- | --- |
+| Files | 12,846 (19.1s average) |
+| Total audio | 68 hours |
+| Wall clock | ~3.7 hours on 3 GPUs |
+| Compute | 11.2 GPU-hours |
+| Cost | **~$16** (≈ $0.23 per hour of audio) |
+
+That run predates GPU batching. At current measured throughput the same job projects to roughly **0.75 GPU-hours, ~$1.10, and ~15 minutes** on 3 GPUs — a projection from benchmark figures, not yet confirmed on a full production run.
+
+### Matching client concurrency to the service
+
+**This is the easiest thing to get wrong, and getting it wrong silently halves your throughput.**
+
+Cloud Run starts a new instance only when the existing ones are full. Since each instance now accepts **3** concurrent requests, sending only 3 in total means all three land on **one** instance — one GPU instead of three.
+
+```text
+client concurrency  =  max-instances  ×  per-instance concurrency
+                    =  3             ×  3                        =  9
+```
+
+So send **9** concurrent requests to use all three GPUs. Fewer, and you are paying for instances you never spin up. If either setting changes, recompute this.
+
+With `batch_client.py`:
+
+```bash
+python batch_client.py --service-url "$SERVICE_URL" \
+    --input files.txt --output results.jsonl \
+    --batch-size 32 --concurrency 9
+```
 
 ---
 
@@ -454,5 +503,5 @@ Free-form context also works: `"A cardiology consultation discussing atrial fibr
 
 - Service owner: `foundary-gcp` project admins
 - Runtime service account: `qwen3-asr-sa@foundary-gcp.iam.gserviceaccount.com`
-- Current revision: `qwen3-asr-00001-dnw`
+- Current revision: `qwen3-asr-00009-fzs` (image `v3`, GPU batching enabled)
 - Source: <https://github.com/Varshneyhars/Qwen3-ASR>

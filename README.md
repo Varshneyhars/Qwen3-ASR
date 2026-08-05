@@ -1,10 +1,19 @@
-# Qwen3-ASR on RunPod Serverless
+# Qwen3-ASR — Serverless Speech Recognition
 
 [![Runpod](https://api.runpod.io/badge/Varshneyhars/Qwen3-ASR)](https://console.runpod.io/hub/Varshneyhars/Qwen3-ASR)
 
-Production-ready serverless deployment of [Qwen/Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B-hf) — Alibaba's open-source multilingual speech recognition model (1.7 B params, 30 languages + 22 Chinese dialects) — as a RunPod Serverless endpoint.
+Production-ready serverless deployment of [Qwen/Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B-hf) — Alibaba's open-source multilingual speech recognition model (1.7 B params, 30 languages + 22 Chinese dialects).
 
 Call it like any HTTP API: send an audio URL or base64 clip, get back a transcript with the detected language, optional word timestamps, or subtitles.
+
+**Two deployment targets, one codebase:**
+
+| Target | Guide | Entrypoint |
+| --- | --- | --- |
+| **RunPod Serverless** | this README | [handler.py](handler.py) — queue worker |
+| **Google Cloud Run (GPU)** | **[GCP.md](GCP.md)** | [server.py](server.py) — HTTP service |
+
+Both share [asr_core.py](asr_core.py), so the request schema, output shape, and every `QWEN_*` setting behave identically on either platform.
 
 ## Features
 
@@ -21,15 +30,21 @@ Call it like any HTTP API: send an audio URL or base64 clip, get back a transcri
 
 | File | Purpose |
 | --- | --- |
-| [handler.py](handler.py) | RunPod serverless entrypoint + Qwen3-ASR / aligner wrapper |
-| [Dockerfile](Dockerfile) | PyTorch 2.8.0 + CUDA 12.8 image, optional weight prefetch |
-| [requirements.txt](requirements.txt) | `runpod`, `transformers>=5.13`, `accelerate`, `librosa` |
+| [asr_core.py](asr_core.py) | **Shared core** — ffmpeg normalization, Qwen3-ASR + aligner, chunking, SRT/VTT. No platform SDK. |
+| [handler.py](handler.py) | RunPod serverless entrypoint (queue worker) |
+| [server.py](server.py) | Cloud Run entrypoint (FastAPI HTTP service) |
+| [Dockerfile](Dockerfile) | RunPod image — PyTorch 2.8.0 + CUDA 12.8, optional weight prefetch |
+| [Dockerfile.cloudrun](Dockerfile.cloudrun) | Cloud Run image — same core, weights always baked in |
+| [requirements.txt](requirements.txt) | Shared core deps |
+| [requirements-runpod.txt](requirements-runpod.txt) / [requirements-cloudrun.txt](requirements-cloudrun.txt) | Per-platform additions |
+| [deploy/gcp/](deploy/gcp/) | Cloud Build config, deploy scripts (bash + PowerShell), service spec, smoke test |
 | [test_input.json](test_input.json) | Sample payload for local testing |
 | [client_example.py](client_example.py) | Python client for `/runsync` and `/run` endpoints |
 | [API.md](API.md) | Full integration guide — all languages, error handling, cost |
+| [GCP.md](GCP.md) | Google Cloud Run deployment guide |
 | [.runpod/hub.json](.runpod/hub.json) | RunPod Hub listing: presets, configurable env vars |
 | [.runpod/tests.json](.runpod/tests.json) | Hub CI tests run on every release |
-| [.dockerignore](.dockerignore) / [.gitignore](.gitignore) | Build and VCS hygiene |
+| [.dockerignore](.dockerignore) / [.gcloudignore](.gcloudignore) / [.gitignore](.gitignore) | Build and VCS hygiene |
 
 ## Why the `-hf` variant
 
@@ -111,6 +126,7 @@ curl -X POST "https://api.runpod.ai/v2/$RUNPOD_ENDPOINT_ID/runsync" \
 | --- | --- | --- | --- |
 | `audio_url` | string | — | `http(s)` URL of the audio. |
 | `audio_base64` | string | — | Base64 audio, padded or not. |
+| `gcs_uri` | string | — | `gs://bucket/object`. Cloud Run only — read with the runtime service account. |
 | `audio` | string \| array | — | Base64 string, or an array of items for batch mode. |
 | `prompt` | string \| array | `null` | **Context biasing.** Free-form text or a word list to bias recognition. Aliases: `context`, `hotwords`. |
 | `language` | string | `null` | Force the language (`"English"` or `"en"`). Omit to auto-detect. |
@@ -118,7 +134,7 @@ curl -X POST "https://api.runpod.ai/v2/$RUNPOD_ENDPOINT_ID/runsync" \
 | `response_format` | string | `"json"` | `json`, `verbose_json`, `text`, `srt`, `vtt`. |
 | `max_new_tokens` | int | `448` | Generation cap per audio window. |
 
-Supply **exactly one** of `audio_url` / `audio_base64` / `audio`. The `srt`, `vtt`, and `verbose_json` formats turn `timestamps` on automatically.
+Supply **exactly one** of `audio_url` / `audio_base64` / `gcs_uri` / `audio`. The `srt`, `vtt`, and `verbose_json` formats turn `timestamps` on automatically.
 
 ### Response
 
@@ -198,7 +214,7 @@ Hard cap is 4 hours (`QWEN_MAX_AUDIO_DURATION_S`). Use `/run` + `/status` pollin
 ## Local Testing
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements-runpod.txt
 python handler.py
 ```
 
@@ -208,6 +224,29 @@ The RunPod SDK auto-detects `test_input.json`, runs the handler once, and prints
 python handler.py --rp_serve_api --rp_api_host 0.0.0.0
 curl -X POST http://localhost:8000/runsync -H 'Content-Type: application/json' -d @test_input.json
 ```
+
+To exercise the Cloud Run server locally instead (needs a CUDA GPU for real inference, but the routes and validation work on CPU):
+
+```bash
+pip install -r requirements-cloudrun.txt
+python server.py                  # serves on :8080
+curl localhost:8080/ready
+curl -X POST localhost:8080/transcribe -H 'Content-Type: application/json' -d @test_input.json
+```
+
+## Deploy on Google Cloud
+
+Cloud Run is GCP's only true serverless GPU — it scales to zero and bills per second. Full walkthrough in **[GCP.md](GCP.md)**; the short version:
+
+```bash
+gcloud config set project YOUR_PROJECT_ID
+./deploy/gcp/deploy.sh              # or: .\deploy\gcp\deploy.ps1 -ProjectId YOUR_PROJECT_ID
+./deploy/gcp/smoke_test.sh
+```
+
+You need **Cloud Run L4 GPU quota** before this works — new projects start at zero, so request it first. See [GCP.md § Prerequisites](GCP.md#prerequisites).
+
+The Cloud Run service adds three endpoints on top of the shared schema: `POST /transcribe` (native), `POST /v1/audio/transcriptions` (OpenAI-compatible file upload), and `POST /runsync` (RunPod-shaped envelope, so an existing client only changes its base URL). Cloud Run caps requests at 60 minutes — see [GCP.md § The 60-minute ceiling](GCP.md#the-60-minute-ceiling) for long audio.
 
 ## Environment Variables
 

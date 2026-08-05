@@ -1,0 +1,5 @@
+-r requirements.txt
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9      # multipart uploads on /v1/audio/transcriptions
+google-cloud-storage>=2.18   # gs:// audio inputs via the runtime service account

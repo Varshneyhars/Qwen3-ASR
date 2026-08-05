@@ -17,6 +17,7 @@ __pycache__
 *.vtt
 outputs/
 test_outputs/
+deploy/
 .vscode
 .idea
 *.md

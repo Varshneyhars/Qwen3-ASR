@@ -1,0 +1,86 @@
+# Google Cloud Run (GPU) image for Qwen3-ASR.
+#
+# Differs from the RunPod Dockerfile in three ways that matter:
+#   1. Serves HTTP on $PORT instead of pulling from a job queue.
+#   2. Weights are baked into the image, not optional. Cloud Run has no network
+#      volume, so a lazy download would repeat on every cold start.
+#   3. Runs as non-root and preloads the model during startup, where Cloud Run
+#      grants a CPU boost, instead of inside the first user request.
+#
+# Cloud Run GPU is NVIDIA L4 (Ada, sm_89), which the CUDA 12.8 base covers.
+FROM pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    DO_NOT_TRACK=1 \
+    HF_HUB_DISABLE_TELEMETRY=1 \
+    TOKENIZERS_PARALLELISM=false \
+    OMP_NUM_THREADS=4 \
+    PORT=8080
+
+# ffmpeg does all container/codec normalization to 16 kHz mono; libsndfile
+# backs soundfile; libgomp is required by numba/librosa.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ffmpeg \
+        libsndfile1 \
+        libgomp1 \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt requirements-cloudrun.txt ./
+RUN pip install --upgrade pip && \
+    pip install -r requirements-cloudrun.txt
+
+# Bake the weights in. Cloud Run instances start from the image every time and
+# have no persistent disk, so anything not in the layer is re-downloaded from
+# Hugging Face on each cold start — 5 GB over the network, inside the startup
+# timeout. Pulling from Artifact Registry in-region is far faster, and Cloud Run
+# streams image layers lazily so the size costs less than it looks.
+ARG MODEL_ID=Qwen/Qwen3-ASR-1.7B-hf
+ARG ALIGNER_MODEL_ID=Qwen/Qwen3-ForcedAligner-0.6B-hf
+ARG PREFETCH_ALIGNER=true
+ENV HF_HOME=/opt/hf-cache \
+    HUGGINGFACE_HUB_CACHE=/opt/hf-cache
+
+RUN python -c "from huggingface_hub import snapshot_download; \
+snapshot_download('$MODEL_ID', cache_dir='/opt/hf-cache')" && \
+    echo "Prefetched $MODEL_ID" && \
+    if [ "$PREFETCH_ALIGNER" = "true" ]; then \
+        python -c "from huggingface_hub import snapshot_download; \
+snapshot_download('$ALIGNER_MODEL_ID', cache_dir='/opt/hf-cache')" && \
+        echo "Prefetched $ALIGNER_MODEL_ID"; \
+    fi
+
+COPY asr_core.py server.py ./
+
+ENV QWEN_MODEL_ID=${MODEL_ID} \
+    QWEN_ALIGNER_MODEL_ID=${ALIGNER_MODEL_ID} \
+    QWEN_PRECISION=bfloat16 \
+    QWEN_ENABLE_ALIGNER=true \
+    QWEN_PRELOAD_MODEL=true \
+    QWEN_MAX_CONCURRENCY=1
+
+# Everything the model needs is in the layer, so refuse to reach out to the Hub
+# at runtime. Turns a transient HF outage from a cold-start failure into a
+# non-event. Unset this if you override QWEN_MODEL_ID at deploy time.
+ENV HF_HUB_OFFLINE=1
+
+EXPOSE 8080
+
+# Non-root: Cloud Run doesn't require it, but nothing here needs root either.
+RUN useradd --create-home --uid 1000 appuser && chown -R appuser /app
+USER appuser
+
+# Single worker — one process owns the GPU. Requests are serialized inside the
+# app and Cloud Run is deployed with --concurrency 1.
+CMD exec uvicorn server:app \
+      --host 0.0.0.0 \
+      --port ${PORT} \
+      --workers 1 \
+      --timeout-keep-alive 620 \
+      --no-access-log

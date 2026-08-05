@@ -1,0 +1,31 @@
+# Files not uploaded to Cloud Build. Keeps the build context small — the image
+# gets its bulk from the base layer and model weights, not from the repo.
+.git
+.gitignore
+.gcloudignore
+.github
+.runpod
+.venv
+venv
+env
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.wav
+*.mp3
+*.flac
+*.m4a
+*.ogg
+*.srt
+*.vtt
+outputs/
+test_outputs/
+.vscode
+.idea
+*.md
+.env
+.env.*
+.mcp.json
+deploy/
+client_example.py

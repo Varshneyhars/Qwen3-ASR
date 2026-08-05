@@ -1,3 +1,6 @@
+# RunPod Serverless image. For Google Cloud Run, build Dockerfile.cloudrun
+# instead — same core, HTTP server instead of the RunPod queue worker.
+#
 # Base: PyTorch 2.8.0 + CUDA 12.8 + cuDNN 9. Qwen3-ASR needs transformers>=5.13
 # (torch>=2.4), and CUDA 12.8 covers Turing through Blackwell, so the image runs
 # on every GPU RunPod Serverless offers.
@@ -30,10 +33,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-COPY requirements.txt .
+COPY requirements.txt requirements-runpod.txt ./
 RUN pip install --upgrade pip && \
-    pip install -r requirements.txt
+    pip install -r requirements-runpod.txt
 
+COPY asr_core.py .
 COPY handler.py .
 COPY test_input.json .
 

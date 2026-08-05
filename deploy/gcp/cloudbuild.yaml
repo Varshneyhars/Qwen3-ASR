@@ -1,0 +1,42 @@
+# Build the Cloud Run GPU image and push it to Artifact Registry.
+#
+#   gcloud builds submit --config deploy/gcp/cloudbuild.yaml \
+#       --substitutions=_REGION=us-central1,_REPO=qwen3-asr,_IMAGE=qwen3-asr,_TAG=v1
+#
+# The build bakes ~5 GB of model weights into the image, so it needs a bigger
+# disk and a longer timeout than a Cloud Build default worker provides.
+
+substitutions:
+  _REGION: us-central1
+  _REPO: qwen3-asr
+  _IMAGE: qwen3-asr
+  _TAG: latest
+  _MODEL_ID: Qwen/Qwen3-ASR-1.7B-hf
+  _ALIGNER_MODEL_ID: Qwen/Qwen3-ForcedAligner-0.6B-hf
+  _PREFETCH_ALIGNER: 'true'
+
+options:
+  machineType: E2_HIGHCPU_8
+  # Base image + torch + CUDA libs + weights lands around 25 GB unpacked.
+  diskSizeGb: 200
+  logging: CLOUD_LOGGING_ONLY
+
+# Downloading weights from Hugging Face dominates; 20 minutes is not enough.
+timeout: 5400s
+
+steps:
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --file=Dockerfile.cloudrun
+      - --tag=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}:${_TAG}
+      - --tag=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}:latest
+      - --build-arg=MODEL_ID=${_MODEL_ID}
+      - --build-arg=ALIGNER_MODEL_ID=${_ALIGNER_MODEL_ID}
+      - --build-arg=PREFETCH_ALIGNER=${_PREFETCH_ALIGNER}
+      - .
+
+images:
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}:${_TAG}
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}:latest

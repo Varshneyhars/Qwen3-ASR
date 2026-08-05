@@ -1,0 +1,84 @@
+# Declarative Cloud Run service. Use this instead of deploy.sh when you want
+# the config in version control, or when you need startup/liveness probes —
+# `gcloud run deploy` flags cannot express those.
+#
+#   sed -e "s/PROJECT_ID/$(gcloud config get-value project)/g" \
+#       deploy/gcp/service.yaml > /tmp/service.yaml
+#   gcloud run services replace /tmp/service.yaml --region us-central1
+#
+# Substitute PROJECT_ID (and REGION, if not us-central1) before applying.
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: qwen3-asr
+  labels:
+    cloud.googleapis.com/location: us-central1
+  annotations:
+    run.googleapis.com/launch-stage: BETA
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/minScale: '0'
+        autoscaling.knative.dev/maxScale: '3'
+        run.googleapis.com/execution-environment: gen2
+        # GPU workloads require CPU to stay allocated outside of requests.
+        run.googleapis.com/cpu-throttling: 'false'
+        run.googleapis.com/startup-cpu-boost: 'true'
+        # Single-zone GPUs are cheaper and currently easier to get capacity for.
+        # Drop this if you need the service to survive a zonal outage.
+        run.googleapis.com/gpu-zonal-redundancy-disabled: 'true'
+    spec:
+      # One in-flight request per instance: one GPU, one model, no batching.
+      containerConcurrency: 1
+      # 3600s is Cloud Run's hard ceiling. Audio longer than roughly 45 minutes
+      # will not finish inside it — see GCP.md for the async pattern.
+      timeoutSeconds: 3600
+      serviceAccountName: qwen3-asr-sa@PROJECT_ID.iam.gserviceaccount.com
+      containers:
+        - image: us-central1-docker.pkg.dev/PROJECT_ID/qwen3-asr/qwen3-asr:v1
+          ports:
+            - name: http1
+              containerPort: 8080
+          resources:
+            limits:
+              cpu: '8'
+              memory: 32Gi
+              nvidia.com/gpu: '1'
+          env:
+            - name: QWEN_PRELOAD_MODEL
+              value: 'true'
+            - name: QWEN_ENABLE_ALIGNER
+              value: 'true'
+            - name: QWEN_PRECISION
+              value: 'bfloat16'
+            - name: QWEN_MAX_CONCURRENCY
+              value: '1'
+            # Uncomment to require a bearer token on top of (or instead of) IAM.
+            # Prefer a Secret Manager reference over a literal value.
+            # - name: QWEN_AUTH_TOKEN
+            #   valueFrom:
+            #     secretKeyRef:
+            #       key: latest
+            #       name: qwen3-asr-token
+          # Holds traffic until the weights are on the GPU, so the first real
+          # request isn't the one that pays for the load. 24 x 10s = 240s, which
+          # is Cloud Run's maximum startup probe budget.
+          startupProbe:
+            httpGet:
+              path: /ready
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 24
+          # /health never touches the model — a long transcription in flight
+          # must not look like a hung instance.
+          livenessProbe:
+            httpGet:
+              path: /health
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+  traffic:
+    - percent: 100
+      latestRevision: true

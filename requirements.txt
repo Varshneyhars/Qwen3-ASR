@@ -1,4 +1,5 @@
-runpod>=1.7.0
+# Shared core. torch/torchvision come from the CUDA base image, not from here.
+# Platform adapters add to this: requirements-runpod.txt, requirements-cloudrun.txt.
 # Qwen3-ASR is supported natively in transformers from v5.13.0 onward.
 transformers>=5.13.0
 accelerate>=1.1.0

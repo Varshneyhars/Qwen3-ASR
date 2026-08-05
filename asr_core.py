@@ -14,6 +14,7 @@ import shutil
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -79,6 +80,13 @@ _ALIGNER_PROCESSOR = None
 _GCS_CLIENT = None
 _MODEL_INFO: Dict[str, Any] = {}
 
+# Serializes model loading. Two threads importing transformers at once — a
+# background preloader and an early request, say — can catch its lazy module
+# system mid-initialization and fail with a spurious
+# "cannot import name 'AutoProcessor' from 'transformers'".
+# Reentrant because warm-up loads the model and then runs inference through it.
+_LOAD_LOCK = threading.RLock()
+
 
 class InputError(ValueError):
     """Bad job input — caller's fault, not retryable."""
@@ -98,34 +106,44 @@ def _dtype():
 
 
 def _get_model():
-    """Load the ASR model + processor once per worker process."""
+    """Load the ASR model + processor once per worker process.
+
+    Thread-safe: concurrent callers block until the first finishes rather than
+    racing on the transformers import.
+    """
     global _MODEL, _PROCESSOR, _MODEL_INFO
-    if _MODEL is None:
-        import torch
-        from transformers import AutoProcessor, Qwen3ASRForConditionalGeneration
+    if _MODEL is not None:
+        return _MODEL, _PROCESSOR  # fast path: no lock once loaded
+    with _LOAD_LOCK:
+        if _MODEL is None:
+            import torch
+            from transformers import AutoProcessor, Qwen3ASRForConditionalGeneration
 
-        started = time.perf_counter()
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        dtype = _dtype()
-        if device == "cpu" and dtype is torch.bfloat16:
-            dtype = torch.float32  # bf16 on CPU is unusably slow
-        print(f"[lazy-init] Loading {MODEL_ID} (device={device}, dtype={dtype})")
+            started = time.perf_counter()
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            dtype = _dtype()
+            if device == "cpu" and dtype is torch.bfloat16:
+                dtype = torch.float32  # bf16 on CPU is unusably slow
+            print(f"[lazy-init] Loading {MODEL_ID} (device={device}, dtype={dtype})")
 
-        _PROCESSOR = AutoProcessor.from_pretrained(MODEL_ID)
-        _MODEL = Qwen3ASRForConditionalGeneration.from_pretrained(
-            MODEL_ID, dtype=dtype, device_map=device
-        )
-        _MODEL.eval()
+            processor = AutoProcessor.from_pretrained(MODEL_ID)
+            model = Qwen3ASRForConditionalGeneration.from_pretrained(
+                MODEL_ID, dtype=dtype, device_map=device
+            )
+            model.eval()
 
-        _MODEL_INFO = {
-            "model_id": MODEL_ID,
-            "device": device,
-            "dtype": str(dtype),
-            "gpu": torch.cuda.get_device_name(0) if device == "cuda" else "cpu",
-            "load_seconds": round(time.perf_counter() - started, 2),
-            "aligner_enabled": ENABLE_ALIGNER,
-        }
-        print(f"[lazy-init] ASR ready in {_MODEL_INFO['load_seconds']}s on {_MODEL_INFO['gpu']}")
+            _MODEL_INFO = {
+                "model_id": MODEL_ID,
+                "device": device,
+                "dtype": str(dtype),
+                "gpu": torch.cuda.get_device_name(0) if device == "cuda" else "cpu",
+                "load_seconds": round(time.perf_counter() - started, 2),
+                "aligner_enabled": ENABLE_ALIGNER,
+            }
+            # Publish only once fully built, so the fast path above can never
+            # hand another thread a half-initialized model.
+            _PROCESSOR, _MODEL = processor, model
+            print(f"[lazy-init] ASR ready in {_MODEL_INFO['load_seconds']}s on {_MODEL_INFO['gpu']}")
     return _MODEL, _PROCESSOR
 
 
@@ -137,24 +155,28 @@ def _get_aligner():
             "Timestamps require the forced aligner, which is disabled "
             "(QWEN_ENABLE_ALIGNER=false on this endpoint)."
         )
-    if _ALIGNER is None:
-        import torch
-        from transformers import AutoModelForTokenClassification, AutoProcessor
+    if _ALIGNER is not None:
+        return _ALIGNER, _ALIGNER_PROCESSOR  # fast path: no lock once loaded
+    with _LOAD_LOCK:
+        if _ALIGNER is None:
+            import torch
+            from transformers import AutoModelForTokenClassification, AutoProcessor
 
-        started = time.perf_counter()
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        dtype = _dtype()
-        if device == "cpu" and dtype is torch.bfloat16:
-            dtype = torch.float32
-        print(f"[lazy-init] Loading aligner {ALIGNER_MODEL_ID}")
+            started = time.perf_counter()
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            dtype = _dtype()
+            if device == "cpu" and dtype is torch.bfloat16:
+                dtype = torch.float32
+            print(f"[lazy-init] Loading aligner {ALIGNER_MODEL_ID}")
 
-        _ALIGNER_PROCESSOR = AutoProcessor.from_pretrained(ALIGNER_MODEL_ID)
-        _ALIGNER = AutoModelForTokenClassification.from_pretrained(
-            ALIGNER_MODEL_ID, dtype=dtype, device_map=device
-        )
-        _ALIGNER.eval()
-        _MODEL_INFO["aligner_load_seconds"] = round(time.perf_counter() - started, 2)
-        print(f"[lazy-init] Aligner ready in {_MODEL_INFO['aligner_load_seconds']}s")
+            processor = AutoProcessor.from_pretrained(ALIGNER_MODEL_ID)
+            aligner = AutoModelForTokenClassification.from_pretrained(
+                ALIGNER_MODEL_ID, dtype=dtype, device_map=device
+            )
+            aligner.eval()
+            _MODEL_INFO["aligner_load_seconds"] = round(time.perf_counter() - started, 2)
+            _ALIGNER_PROCESSOR, _ALIGNER = processor, aligner
+            print(f"[lazy-init] Aligner ready in {_MODEL_INFO['aligner_load_seconds']}s")
     return _ALIGNER, _ALIGNER_PROCESSOR
 
 

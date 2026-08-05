@@ -73,7 +73,11 @@ ENV HF_HUB_OFFLINE=1
 EXPOSE 8080
 
 # Non-root: Cloud Run doesn't require it, but nothing here needs root either.
-RUN useradd --create-home --uid 1000 appuser && chown -R appuser /app
+# The HF cache must be writable too — huggingface_hub rewrites its tree-cache
+# metadata on load, and a read-only cache spams "Permission denied" warnings
+# on every startup.
+RUN useradd --create-home --uid 1000 appuser \
+    && chown -R appuser /app /opt/hf-cache
 USER appuser
 
 # Single worker — one process owns the GPU. Requests are serialized inside the

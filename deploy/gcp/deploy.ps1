@@ -107,6 +107,10 @@ if (-not $SkipBuild) {
 $authFlag = '--no-allow-unauthenticated'
 if ($AllowUnauthenticated) { $authFlag = '--allow-unauthenticated' }
 
+# The startup probe is not optional. Without it Cloud Run routes traffic the
+# moment the port opens — while the model is still loading — and a burst of
+# cold requests comes back as 500s and "Rate exceeded" instead of queueing.
+# 24 x 10s = 240s, Cloud Run's maximum startup budget.
 Write-Host '==> Deploying to Cloud Run'
 gcloud run deploy $Service `
     --image $image `
@@ -127,6 +131,8 @@ gcloud run deploy $Service `
     --service-account $serviceAccount `
     --no-cpu-throttling `
     --set-env-vars "QWEN_PRELOAD_MODEL=true,QWEN_ENABLE_ALIGNER=true,QWEN_PRECISION=bfloat16,QWEN_MAX_CONCURRENCY=$Concurrency" `
+    --startup-probe "httpGet.path=/ready,initialDelaySeconds=5,periodSeconds=10,timeoutSeconds=5,failureThreshold=24" `
+    --liveness-probe "httpGet.path=/health,periodSeconds=30,timeoutSeconds=5,failureThreshold=3" `
     $authFlag
 if ($LASTEXITCODE -ne 0) { throw 'Cloud Run deploy failed.' }
 

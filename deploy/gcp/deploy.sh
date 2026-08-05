@@ -112,6 +112,10 @@ fi
 AUTH_FLAG="--no-allow-unauthenticated"
 [[ "${ALLOW_UNAUTH}" == "true" ]] && AUTH_FLAG="--allow-unauthenticated"
 
+# The startup probe is not optional. Without it Cloud Run routes traffic the
+# moment the port opens — while the model is still loading — and a burst of
+# cold requests comes back as 500s and "Rate exceeded" instead of queueing.
+# 24 x 10s = 240s, Cloud Run's maximum startup budget.
 echo "==> Deploying to Cloud Run"
 gcloud run deploy "${SERVICE}" \
   --image "${IMAGE}" \
@@ -132,6 +136,8 @@ gcloud run deploy "${SERVICE}" \
   --service-account "${SERVICE_ACCOUNT}" \
   --no-cpu-throttling \
   --set-env-vars "QWEN_PRELOAD_MODEL=true,QWEN_ENABLE_ALIGNER=true,QWEN_PRECISION=bfloat16,QWEN_MAX_CONCURRENCY=${CONCURRENCY}" \
+  --startup-probe "httpGet.path=/ready,initialDelaySeconds=5,periodSeconds=10,timeoutSeconds=5,failureThreshold=24" \
+  --liveness-probe "httpGet.path=/health,periodSeconds=30,timeoutSeconds=5,failureThreshold=3" \
   ${AUTH_FLAG}
 
 URL="$(gcloud run services describe "${SERVICE}" --region "${REGION}" \

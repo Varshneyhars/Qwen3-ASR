@@ -1,5 +1,16 @@
 __pycache__/
 *.pyc
+
+# Credentials — this repo is PUBLIC. Never commit service account keys.
+*-key.json
+*key*.json
+asr-client*.json
+service-account*.json
+credentials*.json
+gcp-*.json
+*.pem
+results.jsonl
+files.txt
 .venv/
 venv/
 .env

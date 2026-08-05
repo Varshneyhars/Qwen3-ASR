@@ -47,6 +47,10 @@ BLOCK_PRIVATE_URLS = os.environ.get("QWEN_BLOCK_PRIVATE_URLS", "true").lower() =
 # tmpfs backed by the instance's memory, so this counts against --memory.
 WORK_ROOT = os.environ.get("QWEN_WORK_DIR") or None
 
+# Run a throwaway inference during warmup to pay CUDA's kernel-compilation cost
+# up front. Adds ~20s to startup and saves the same on the first real request.
+WARMUP_INFERENCE = os.environ.get("QWEN_WARMUP_INFERENCE", "true").lower() == "true"
+
 # Segment grouping for subtitles, derived from word timings.
 SEGMENT_MAX_GAP_S = float(os.environ.get("QWEN_SEGMENT_MAX_GAP_S", "0.6"))
 SEGMENT_MAX_CHARS = int(os.environ.get("QWEN_SEGMENT_MAX_CHARS", "84"))
@@ -163,8 +167,42 @@ def is_loaded() -> bool:
     return _MODEL is not None
 
 
+def _warm_kernels() -> None:
+    """Run one throwaway inference so CUDA does its kernel autotuning here.
+
+    Loading the weights is not enough. The first generate() on a fresh CUDA
+    context pays a large one-off kernel-compilation cost — measured on a Cloud
+    Run L4, the first request took 24s for 6s of audio versus ~1.0s once warm.
+    Without this, the readiness probe goes green while the service is still
+    slow, and the first real caller eats the difference.
+    """
+    import wave
+
+    started = time.perf_counter()
+    tmp = tempfile.mkdtemp(prefix="qwen-warm-", dir=WORK_ROOT)
+    try:
+        path = os.path.join(tmp, "silence.wav")
+        with wave.open(path, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(SAMPLE_RATE)
+            w.writeframes(b"\x00\x00" * SAMPLE_RATE)  # 1 second of silence
+
+        _transcribe_batch([path], None, None, 8)
+        if _ALIGNER is not None:
+            # Same story for the aligner's kernels. Aligning silence is
+            # meaningless; _align_words swallows the failure either way.
+            _align_words(path, "warm up", None)
+        print(f"[warmup] kernels warm in {time.perf_counter() - started:.1f}s")
+    except Exception as e:
+        # A failed warm-up costs latency, not correctness. Never block serving.
+        print(f"[warmup] kernel warm-up skipped ({type(e).__name__}: {e})")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def warmup(aligner: Optional[bool] = None) -> Dict[str, Any]:
-    """Force the model load now instead of on the first request.
+    """Force the model load and CUDA warm-up now instead of on the first request.
 
     Cloud Run bills for the whole instance lifetime once a GPU is attached, so
     paying the 30-90s load during startup (where CPU boost applies) is strictly
@@ -176,6 +214,8 @@ def warmup(aligner: Optional[bool] = None) -> Dict[str, Any]:
             _get_aligner()
         except Exception as e:  # a broken aligner must not block ASR serving
             print(f"[warmup] aligner load failed ({type(e).__name__}: {e})")
+    if WARMUP_INFERENCE:
+        _warm_kernels()
     return model_info()
 
 

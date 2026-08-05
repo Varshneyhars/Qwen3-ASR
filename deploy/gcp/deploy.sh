@@ -15,6 +15,11 @@ REPO="${REPO:-qwen3-asr}"
 IMAGE_NAME="${IMAGE_NAME:-qwen3-asr}"
 TAG="${TAG:-v1}"
 SERVICE_ACCOUNT_NAME="${SERVICE_ACCOUNT_NAME:-qwen3-asr-sa}"
+# Projects created from ~2024 on no longer get the legacy
+# PROJECT_NUMBER@cloudbuild.gserviceaccount.com identity, and `gcloud builds
+# submit` then fails with PERMISSION_DENIED even for a project owner. Running
+# builds as an explicit service account works on old and new projects alike.
+BUILD_SA_NAME="${BUILD_SA_NAME:-qwen3-asr-build}"
 
 # L4 is the only GPU Cloud Run offers. It requires >=4 CPU and >=16Gi; 8/32
 # gives ffmpeg room to work and headroom for /tmp, which is a memory-backed
@@ -30,6 +35,7 @@ ALLOW_UNAUTH="${ALLOW_UNAUTH:-false}"
 
 IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/${IMAGE_NAME}:${TAG}"
 SERVICE_ACCOUNT="${SERVICE_ACCOUNT_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+BUILD_SA="${BUILD_SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 
 if [[ -z "${PROJECT_ID}" ]]; then
   echo "ERROR: no project set. Run 'gcloud config set project YOUR_PROJECT' or pass PROJECT_ID=..." >&2
@@ -62,17 +68,41 @@ gcloud iam service-accounts create "${SERVICE_ACCOUNT_NAME}" \
   --display-name "Qwen3-ASR Cloud Run runtime" \
   --project "${PROJECT_ID}"
 
-# Needed only for gs:// audio inputs. Harmless otherwise, and scoped to read.
-gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
-  --member "serviceAccount:${SERVICE_ACCOUNT}" \
-  --role roles/storage.objectViewer \
-  --condition=None >/dev/null
+# Needed only for gs:// audio inputs, so a failure here (usually because the
+# deployer isn't a project owner) must not sink an otherwise fine deploy.
+if ! gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+      --member "serviceAccount:${SERVICE_ACCOUNT}" \
+      --role roles/storage.objectViewer \
+      --condition=None >/dev/null 2>&1; then
+  echo "    WARNING: could not grant roles/storage.objectViewer to ${SERVICE_ACCOUNT}."
+  echo "             Everything works except gs:// audio inputs. Grant it later with:"
+  echo "               gcloud projects add-iam-policy-binding ${PROJECT_ID} \\"
+  echo "                 --member=serviceAccount:${SERVICE_ACCOUNT} --role=roles/storage.objectViewer"
+fi
 
 if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
+  echo "==> Ensuring build service account '${BUILD_SA}'"
+  gcloud iam service-accounts describe "${BUILD_SA}" --project "${PROJECT_ID}" >/dev/null 2>&1 || \
+  gcloud iam service-accounts create "${BUILD_SA_NAME}" \
+    --display-name "Qwen3-ASR Cloud Build" \
+    --project "${PROJECT_ID}"
+
+  # Least privilege for a build: push the image, write logs, read the uploaded
+  # source tarball. Deliberately not roles/editor.
+  for role in roles/artifactregistry.writer roles/logging.logWriter roles/storage.objectAdmin; do
+    gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+      --member "serviceAccount:${BUILD_SA}" \
+      --role "${role}" --condition=None >/dev/null
+  done
+
   echo "==> Building image (this takes 15-30 min; it downloads ~5 GB of weights)"
+  # --default-buckets-behavior is required alongside --service-account: the
+  # legacy global staging bucket isn't usable with a user-specified identity.
   gcloud builds submit \
     --config deploy/gcp/cloudbuild.yaml \
     --project "${PROJECT_ID}" \
+    --service-account "projects/${PROJECT_ID}/serviceAccounts/${BUILD_SA}" \
+    --default-buckets-behavior=regional-user-owned-bucket \
     --substitutions "_REGION=${REGION},_REPO=${REPO},_IMAGE=${IMAGE_NAME},_TAG=${TAG}" \
     .
 else

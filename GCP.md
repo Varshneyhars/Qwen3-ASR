@@ -22,7 +22,7 @@ Cloud Run attaches one **NVIDIA L4 (24 GB)** per instance. Qwen3-ASR needs ~4 GB
 
 ## Architecture
 
-```
+```text
 Client ──HTTPS──> Cloud Run (L4 GPU, scale 0..N)
                     │  server.py     FastAPI, one request per instance
                     │  asr_core.py   ffmpeg → Qwen3-ASR → aligner → SRT/VTT
@@ -43,15 +43,26 @@ The key difference from RunPod: **there is no job queue.** RunPod holds a reques
 
 - `gcloud` CLI, authenticated: `gcloud auth login`
 - A project with billing enabled
-- **GPU quota.** This is the step that blocks people. Request it before you build:
+- **GPU quota.** Projects get a default allocation of **3 GPUs on first deployment**, so a single-instance deploy normally works without any request. You only need to ask when scaling past it:
 
   Console → **IAM & Admin → Quotas** → filter for
   `Total Nvidia L4 GPU allocation without zonal redundancy, per project per region`
-  under the **Cloud Run Admin API**, and request at least `1` in your region.
+  under the **Cloud Run Admin API**.
 
-  New projects start at 0. Approval usually takes minutes to a couple of days.
+  Requests for the *non-redundant* quota are granted faster than the zonally-redundant one — which is one reason this deployment passes `--no-gpu-zonal-redundancy`.
 
-- A region that offers Cloud Run GPUs — `us-central1`, `us-east4`, `europe-west1`, `europe-west4`, `asia-southeast1`, `asia-south1`, and others. Check [Cloud Run GPU locations](https://cloud.google.com/run/docs/locations) for the current list.
+- **A region that offers Cloud Run GPUs.** Only six do:
+
+  | Region | Location | Notes |
+  | --- | --- | --- |
+  | `us-central1` | Iowa | **Default here.** Largest capacity. |
+  | `us-east4` | N. Virginia | Good US East alternative. |
+  | `europe-west1` | Belgium | |
+  | `europe-west4` | Netherlands | |
+  | `asia-southeast1` | Singapore | Closest generally-available region to India. |
+  | `asia-south1` | Mumbai | ⚠️ **Invitation only** — request access via your GCP account team. |
+
+  Scaling hard in `us-central1` or `us-east4` may need a quota increase. Check [Cloud Run GPU docs](https://cloud.google.com/run/docs/configuring/services/gpu) for the current list — it changes.
 
 ---
 
@@ -223,6 +234,7 @@ Levers, roughly in order of impact:
 Check current rates on the [Cloud Run pricing page](https://cloud.google.com/run/pricing) — GPU, CPU, and memory are billed separately, and rates change.
 
 > **Scheduled warm-up.** If your traffic is predictable (say, business hours), Cloud Scheduler hitting `POST /warmup` is much cheaper than `MIN_INSTANCES=1`:
+>
 > ```bash
 > gcloud scheduler jobs create http qwen3-asr-warmup \
 >   --location us-central1 --schedule "*/10 8-18 * * 1-5" \

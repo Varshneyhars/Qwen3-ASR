@@ -37,13 +37,13 @@ COPY requirements.txt requirements-runpod.txt ./
 RUN pip install --upgrade pip && \
     pip install -r requirements-runpod.txt
 
-COPY asr_core.py .
-COPY handler.py .
-COPY test_input.json .
 
-# Optional: pre-download weights into the image so cold starts don't block on
-# HF. ~4.1 GB for the ASR model + ~1.8 GB for the aligner. Set false to lazy-
-# download onto a RunPod network volume instead.
+# Pre-download weights BEFORE copying source. Docker invalidates every layer
+# after the first one that changes, so with this sitting below the COPY lines
+# a one-line Python edit re-digested ~6 GB of weights and forced every worker
+# to pull them again — enough to push container startup past RunPod's deadline.
+# Kept above the source, the weights layer stays stable across code changes.
+# Set PREFETCH_MODEL=false to lazy-download onto a network volume instead.
 ARG PREFETCH_MODEL=true
 ARG MODEL_ID=Qwen/Qwen3-ASR-1.7B-hf
 ARG ALIGNER_MODEL_ID=Qwen/Qwen3-ForcedAligner-0.6B-hf
@@ -58,6 +58,12 @@ snapshot_download('$MODEL_ID', cache_dir='/opt/hf-cache')" && \
 snapshot_download('$ALIGNER_MODEL_ID', cache_dir='/opt/hf-cache')" && \
         echo "Prefetched $ALIGNER_MODEL_ID"; \
     fi
+
+# Source last: these layers are kilobytes, so a code change re-pushes almost
+# nothing and workers keep their cached weights layer.
+COPY asr_core.py .
+COPY handler.py .
+COPY test_input.json .
 
 ENV HF_HOME=/opt/hf-cache \
     HUGGINGFACE_HUB_CACHE=/opt/hf-cache \

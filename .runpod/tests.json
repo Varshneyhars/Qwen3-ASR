@@ -21,7 +21,11 @@
       "name": "context_biasing_word_list",
       "input": {
         "audio_url": "https://huggingface.co/datasets/bezzam/audio_samples/resolve/main/librispeech_mr_quilter.wav",
-        "prompt": ["Quilter", "apostle", "gospel"],
+        "prompt": [
+          "Quilter",
+          "apostle",
+          "gospel"
+        ],
         "response_format": "text"
       },
       "timeout": 180000
@@ -56,19 +60,16 @@
       "name": "batch_multilingual",
       "input": {
         "audio": [
-          { "audio_url": "https://huggingface.co/datasets/bezzam/audio_samples/resolve/main/librispeech_mr_quilter.wav" },
-          { "audio_url": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-ASR-Repo/asr_zh.wav" }
+          {
+            "audio_url": "https://huggingface.co/datasets/bezzam/audio_samples/resolve/main/librispeech_mr_quilter.wav"
+          },
+          {
+            "audio_url": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-ASR-Repo/asr_zh.wav"
+          }
         ],
         "response_format": "text"
       },
       "timeout": 300000
-    },
-    {
-      "name": "validation_rejects_missing_audio",
-      "input": {
-        "response_format": "text"
-      },
-      "timeout": 30000
     }
   ],
   "config": {

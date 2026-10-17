@@ -27,14 +27,21 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 import asr_core
 
-# One GPU, one model instance. Concurrent generate() calls on the same module
-# would race on CUDA memory and give no throughput win, so inference is
-# serialized here. Cloud Run is deployed with a HIGHER --concurrency than this
-# on purpose: the extra requests queue at the instance rather than being
-# refused, and a caller sizing its parallelism from concurrency x max-instances
-# keeps every instance fed. See deploy/gcp/deploy.sh (CONCURRENCY vs GPU_SLOTS).
-MAX_CONCURRENCY = max(1, int(os.environ.get("QWEN_MAX_CONCURRENCY", "1")))
-_gpu_slots = threading.BoundedSemaphore(MAX_CONCURRENCY)
+# How many requests may be inside asr_core at once. This is NOT the GPU limit.
+#
+# asr_core owns that (asr_core.GPU_SLOTS) and holds it only around a forward
+# pass, so a request waiting for the GPU is still free to download, transcode
+# and probe its audio. This number is larger than GPU_SLOTS on purpose, by
+# QWEN_PREFETCH_REQUESTS: while one request is on the GPU, the next ones are
+# already fetching, and the GPU gets its next batch handed to it ready.
+#
+# It used to be the GPU limit, wrapped around the whole of asr_core.transcribe.
+# That meant the GPU sat idle through the next request's entire prefix: 32
+# downloads, transcodes and duration probes, every request, with the device
+# doing nothing. Prefetching is the single change that stops that.
+PREFETCH_REQUESTS = max(0, int(os.environ.get("QWEN_PREFETCH_REQUESTS", "2")))
+ADMIT_CONCURRENCY = asr_core.GPU_SLOTS + PREFETCH_REQUESTS
+_admit = threading.BoundedSemaphore(ADMIT_CONCURRENCY)
 
 # Load the weights during startup rather than inside the first user request.
 # Cloud Run grants a CPU boost while an instance is starting, so this is both
@@ -77,7 +84,9 @@ def _load_models() -> None:
 @asynccontextmanager
 async def _lifespan(_: FastAPI):
     _log("INFO", "starting", model=asr_core.MODEL_ID, preload=PRELOAD,
-         aligner=asr_core.ENABLE_ALIGNER, concurrency=MAX_CONCURRENCY)
+         aligner=asr_core.ENABLE_ALIGNER, gpu_slots=asr_core.GPU_SLOTS,
+         admit=ADMIT_CONCURRENCY, fetch_workers=asr_core.FETCH_WORKERS,
+         gpu_batch=asr_core.GPU_BATCH_SIZE, max_batch_items=asr_core.MAX_BATCH_ITEMS)
     if PRELOAD:
         # In a background thread so uvicorn binds $PORT immediately. Cloud Run
         # kills an instance that hasn't opened its port within the startup
@@ -166,14 +175,20 @@ def warmup_endpoint() -> Dict[str, Any]:
 #                                 Transcription                                #
 # --------------------------------------------------------------------------- #
 def _run_blocking(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Serialize GPU work behind the semaphore, on a worker thread."""
-    acquired = _gpu_slots.acquire(timeout=float(os.environ.get("QWEN_QUEUE_TIMEOUT_S", "900")))
+    """Admit a request into asr_core, on a worker thread.
+
+    The GPU is gated inside asr_core, not here, so this only caps how many
+    requests may be fetching and transcoding at the same time. 503 rather than a
+    long silence once even that is full, because a caller can retry a 503 and
+    cannot do anything with a connection that simply never answers.
+    """
+    acquired = _admit.acquire(timeout=float(os.environ.get("QWEN_QUEUE_TIMEOUT_S", "900")))
     if not acquired:
         raise HTTPException(status_code=503, detail="Server busy; all inference slots are in use.")
     try:
         return asr_core.transcribe(payload)
     finally:
-        _gpu_slots.release()
+        _admit.release()
 
 
 async def _transcribe_async(payload: Dict[str, Any], request_id: str) -> Dict[str, Any]:

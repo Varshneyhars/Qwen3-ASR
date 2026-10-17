@@ -6,6 +6,7 @@ transcribe() with the same input dict and get the same output dict back.
 """
 import base64
 import binascii
+import contextlib
 import ipaddress
 import json
 import os
@@ -51,6 +52,18 @@ DOWNLOAD_TRIES = max(1, int(os.environ.get("QWEN_DOWNLOAD_TRIES", "3")))
 # threads parallelise it properly despite the GIL. Matches the 8 vCPU an L4
 # instance is deployed with; set to 1 to go back to serial.
 FETCH_WORKERS = max(1, int(os.environ.get("QWEN_FETCH_WORKERS", "8")))
+
+# GPU slots. Only the forward passes are gated by this, never the fetch, and
+# that distinction is the whole point: a request that is waiting its turn on the
+# GPU must still be free to download and transcode its audio. Gate the fetch too
+# (as this did when the semaphore lived in the HTTP layer) and the GPU goes idle
+# for the length of the next request's entire prefix, every single request.
+GPU_SLOTS = max(1, int(os.environ.get("QWEN_MAX_CONCURRENCY", "1")))
+GPU_QUEUE_TIMEOUT_S = float(os.environ.get("QWEN_QUEUE_TIMEOUT_S", "900"))
+_gpu_gate = threading.BoundedSemaphore(GPU_SLOTS)
+
+_fetch_pool: Optional["ThreadPoolExecutor"] = None
+_fetch_pool_lock = threading.Lock()
 MAX_BATCH_ITEMS = int(os.environ.get("QWEN_MAX_BATCH_ITEMS", "32"))
 
 # How many clips share a single GPU forward pass. Running one clip at a time
@@ -439,6 +452,44 @@ def _transcode(src: str, dest: str) -> None:
         raise InputError(f"ffmpeg could not decode the audio: {stderr or '<no output>'}")
 
 
+@contextlib.contextmanager
+def _gpu_slot():
+    """Hold a GPU slot for one forward pass.
+
+    Deliberately narrow. Everything outside it (downloads, ffmpeg, ffprobe,
+    decoding the output) runs while another request owns the GPU, which is what
+    keeps the device fed instead of waiting on somebody's network.
+    """
+    if not _gpu_gate.acquire(timeout=GPU_QUEUE_TIMEOUT_S):
+        raise RuntimeError(
+            f"GPU busy: no slot came free within {GPU_QUEUE_TIMEOUT_S:.0f}s.")
+    try:
+        yield
+    finally:
+        _gpu_gate.release()
+
+
+def _get_fetch_pool() -> "ThreadPoolExecutor":
+    """One pool for the whole process, not one per request.
+
+    FETCH_WORKERS is a total, so three concurrent requests share eight
+    downloads rather than starting eight each and thrashing eight vCPUs with
+    twenty-four ffmpeg processes. Sharing it is also what gives prefetch for
+    free: a request's workers are released the moment its items are
+    materialised, so the next request starts downloading while the first is
+    still on the GPU.
+
+    Never shut down. It lives as long as the process, and a pool that outlives
+    every request has nothing to clean up.
+    """
+    global _fetch_pool
+    with _fetch_pool_lock:
+        if _fetch_pool is None:
+            _fetch_pool = ThreadPoolExecutor(
+                max_workers=FETCH_WORKERS, thread_name_prefix="qwen-fetch")
+        return _fetch_pool
+
+
 def _materialize_audio(value: str, workdir: str, idx: int = 0) -> Tuple[str, float, str, int]:
     """Accept a URL, gs:// URI, data URI, or raw base64.
 
@@ -530,8 +581,9 @@ def _transcribe_batch(
 
     inputs = processor.apply_transcription_request(**kwargs).to(model.device, model.dtype)
 
-    with torch.inference_mode():
-        output_ids = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+    with _gpu_slot():
+        with torch.inference_mode():
+            output_ids = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
     generated = output_ids[:, inputs["input_ids"].shape[1]:]
 
     parsed = processor.decode(generated, return_format="parsed")
@@ -560,8 +612,9 @@ def _align_words(wav: str, transcript: str, language: Optional[str],
             audio=wav, transcript=transcript, language=language or "English",
         )
         aligner_inputs = aligner_inputs.to(aligner.device, aligner.dtype)
-        with torch.inference_mode():
-            outputs = aligner(**aligner_inputs)
+        with _gpu_slot():
+            with torch.inference_mode():
+                outputs = aligner(**aligner_inputs)
         aligned = aligner_processor.decode_forced_alignment(
             logits=outputs.logits,
             input_ids=aligner_inputs["input_ids"],
@@ -890,20 +943,19 @@ def _transcribe_grouped(req: Dict[str, Any]) -> List[Dict[str, Any]]:
                     "nbytes": nbytes, "fetch_s": time.perf_counter() - t0}
 
         prepared: Dict[int, Dict[str, Any]] = {}
-        workers = min(FETCH_WORKERS, max(1, n))
-        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="qwen-fetch") as pool:
-            futures = {
-                pool.submit(_prepare, i, source): i
-                for i, source in enumerate(req["sources"])
-            }
-            for future, i in futures.items():
-                try:
-                    prepared[i] = future.result()
-                except InputError as e:
-                    results[i] = {"error": str(e), "index": i}
-                except Exception as e:
-                    print(f"[error] item {i}: {type(e).__name__}: {e}")
-                    results[i] = {"error": f"{type(e).__name__}: {e}", "index": i}
+        pool = _get_fetch_pool()
+        futures = {
+            pool.submit(_prepare, i, source): i
+            for i, source in enumerate(req["sources"])
+        }
+        for future, i in futures.items():
+            try:
+                prepared[i] = future.result()
+            except InputError as e:
+                results[i] = {"error": str(e), "index": i}
+            except Exception as e:
+                print(f"[error] item {i}: {type(e).__name__}: {e}")
+                results[i] = {"error": f"{type(e).__name__}: {e}", "index": i}
 
         # Rebuilt in the order asked, so a log or a tie in the duration sort
         # below reads the same way it did when this ran serially.

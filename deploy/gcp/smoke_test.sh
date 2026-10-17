@@ -42,11 +42,11 @@ check() {
 
 echo "==> ${URL}"
 
-echo "[1/5] liveness"
+echo "[1/7] liveness"
 code="$(curl -s -o /dev/null -w '%{http_code}' "${AUTH[@]}" "${URL}/health")"
 check "GET /health" 200 "${code}"
 
-echo "[2/5] readiness (waits up to 5 min for a cold start)"
+echo "[2/7] readiness (waits up to 5 min for a cold start)"
 for _ in $(seq 1 60); do
   code="$(curl -s -o /dev/null -w '%{http_code}' "${AUTH[@]}" "${URL}/ready")"
   [[ "${code}" == "200" ]] && break
@@ -54,7 +54,7 @@ for _ in $(seq 1 60); do
 done
 check "GET /ready" 200 "${code}"
 
-echo "[3/5] transcription"
+echo "[3/7] transcription"
 body="$(curl -s "${AUTH[@]}" -H 'Content-Type: application/json' \
   -d "{\"audio_url\":\"${SAMPLE}\",\"response_format\":\"text\"}" \
   "${URL}/transcribe")"
@@ -66,7 +66,7 @@ else
   fail=1
 fi
 
-echo "[4/5] subtitles + timestamps"
+echo "[4/7] subtitles + timestamps"
 body="$(curl -s "${AUTH[@]}" -H 'Content-Type: application/json' \
   -d "{\"audio_url\":\"${SAMPLE}\",\"response_format\":\"srt\"}" \
   "${URL}/transcribe")"
@@ -77,11 +77,36 @@ else
   fail=1
 fi
 
-echo "[5/5] input validation rejects a bad request"
+echo "[5/7] input validation rejects a bad request"
 code="$(curl -s -o /dev/null -w '%{http_code}' "${AUTH[@]}" \
   -H 'Content-Type: application/json' -d '{"response_format":"text"}' \
   "${URL}/transcribe")"
 check "POST /transcribe (no audio)" 400 "${code}"
+
+echo "[6/7] POST /batch returns a result per id"
+body="$(curl -s "${AUTH[@]}" -H 'Content-Type: application/json' \
+  -d "{\"items\":[{\"id\":\"smoke-a\",\"gcs_uri\":\"${SAMPLE}\"},{\"id\":\"smoke-b\",\"gcs_uri\":\"${SAMPLE}\"}]}" \
+  "${URL}/batch")"
+# Both ids must come back, because a caller matches on id and never on position.
+if grep -q '"id": *"smoke-a"' <<<"${body}" && grep -q '"id": *"smoke-b"' <<<"${body}"; then
+  echo "  PASS  both ids echoed on their own result"
+else
+  echo "  FAIL  /batch did not answer for both ids: ${body:0:300}"
+  fail=1
+fi
+
+echo "[7/7] POST /batch isolates one unreachable item"
+body="$(curl -s "${AUTH[@]}" -H 'Content-Type: application/json' \
+  -d "{\"items\":[{\"id\":\"good\",\"gcs_uri\":\"${SAMPLE}\"},{\"id\":\"bad\",\"gcs_uri\":\"https://example.invalid/nope.wav\"}]}" \
+  "${URL}/batch")"
+# One bad URL must cost one clip, not the request. The prototype this replaced
+# let the exception escape and returned 500 for every clip in the batch.
+if grep -q '"id": *"good"' <<<"${body}" && grep -q '"id": *"bad"' <<<"${body}"; then
+  echo "  PASS  the good clip still returned, the bad one came back as an error"
+else
+  echo "  FAIL  a single bad URL took the batch with it: ${body:0:300}"
+  fail=1
+fi
 
 echo
 if [[ "${fail}" -eq 0 ]]; then

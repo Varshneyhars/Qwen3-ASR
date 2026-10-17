@@ -27,9 +27,27 @@ BUILD_SA_NAME="${BUILD_SA_NAME:-qwen3-asr-build}"
 GPU_TYPE="${GPU_TYPE:-nvidia-l4}"
 CPU="${CPU:-8}"
 MEMORY="${MEMORY:-32Gi}"
-MAX_INSTANCES="${MAX_INSTANCES:-3}"
+MAX_INSTANCES="${MAX_INSTANCES:-12}"
 MIN_INSTANCES="${MIN_INSTANCES:-0}"    # 0 = scale to zero, at the cost of cold starts
-CONCURRENCY="${CONCURRENCY:-1}"        # one GPU, one in-flight request
+
+# CONCURRENCY x MAX_INSTANCES is how many requests may be in flight at once, and
+# callers size their own parallelism from it: 3 x 12 = 36. GPU_SLOTS is separate
+# and smaller on purpose. Cloud Run accepting three requests per instance keeps
+# them queued at the instance instead of refused, while GPU_SLOTS=1 keeps one
+# forward pass running at a time, which is what a single L4 actually wants.
+# Raising GPU_SLOTS without measuring trades throughput for CUDA OOM risk.
+CONCURRENCY="${CONCURRENCY:-3}"
+GPU_SLOTS="${GPU_SLOTS:-1}"
+
+# Clips per GPU forward pass. The processor pads every item in a pass to the
+# longest one, which is why asr_core sorts a batch by duration before grouping.
+GPU_BATCH_SIZE="${GPU_BATCH_SIZE:-32}"
+# Items accepted in one /batch request. Callers pack to this, so it is also the
+# number the ingest's own batch size is pinned to.
+MAX_BATCH_ITEMS="${MAX_BATCH_ITEMS:-32}"
+# Downloads, transcodes and duration probes running at once inside one request.
+# Matches CPU below; this prefix used to run serially and dominated a big batch.
+FETCH_WORKERS="${FETCH_WORKERS:-8}"
 TIMEOUT="${TIMEOUT:-3600}"             # Cloud Run's ceiling is 60 minutes
 ALLOW_UNAUTH="${ALLOW_UNAUTH:-false}"
 
@@ -44,6 +62,8 @@ fi
 
 echo "==> Project ${PROJECT_ID} / region ${REGION} / service ${SERVICE}"
 echo "==> Image ${IMAGE}"
+echo "==> ${CONCURRENCY} req/instance x ${MAX_INSTANCES} instances = $((CONCURRENCY * MAX_INSTANCES)) slots"
+echo "==> ${GPU_SLOTS} GPU slot(s)/instance, ${GPU_BATCH_SIZE} clips/pass, ${MAX_BATCH_ITEMS} items/request, ${FETCH_WORKERS} parallel fetches"
 
 echo "==> Enabling APIs"
 gcloud services enable \
@@ -135,7 +155,7 @@ gcloud run deploy "${SERVICE}" \
   --port 8080 \
   --service-account "${SERVICE_ACCOUNT}" \
   --no-cpu-throttling \
-  --set-env-vars "QWEN_PRELOAD_MODEL=true,QWEN_ENABLE_ALIGNER=true,QWEN_PRECISION=bfloat16,QWEN_MAX_CONCURRENCY=${CONCURRENCY}" \
+  --set-env-vars "QWEN_PRELOAD_MODEL=true,QWEN_ENABLE_ALIGNER=true,QWEN_PRECISION=bfloat16,QWEN_MAX_CONCURRENCY=${GPU_SLOTS},QWEN_GPU_BATCH_SIZE=${GPU_BATCH_SIZE},QWEN_MAX_BATCH_ITEMS=${MAX_BATCH_ITEMS},QWEN_FETCH_WORKERS=${FETCH_WORKERS}" \
   --startup-probe "httpGet.path=/ready,initialDelaySeconds=5,periodSeconds=10,timeoutSeconds=5,failureThreshold=24" \
   --liveness-probe "httpGet.path=/health,periodSeconds=30,timeoutSeconds=5,failureThreshold=3" \
   ${AUTH_FLAG}

@@ -323,6 +323,85 @@ Capped at 32 items (`QWEN_MAX_BATCH_ITEMS`).
 
 ---
 
+## `POST /batch` (Cloud Run only)
+
+The batch shape above answers positionally, which means a caller has to trust
+that `results[3]` is the clip it asked about third. `/batch` exists so it does
+not have to: every result carries the `id` it was asked under.
+
+```json
+{
+  "items": [
+    {"id": "clips/a.wav", "gcs_uri": "https://bucket.s3.../a.wav?X-Amz-Signature=..."},
+    {"id": "clips/b.wav", "gcs_uri": "gs://bucket/clips/b.wav"}
+  ],
+  "language": "Italian"
+}
+```
+
+Response:
+
+```json
+{
+  "results": [
+    {"id": "clips/a.wav", "text": "Prima clip.", "language": "Italian", "duration": 4.1}
+  ],
+  "errors": [
+    {"id": "clips/b.wav", "error": "ConnectionResetError: [Errno 104] Connection reset by peer"}
+  ],
+  "n": 1,
+  "elapsed_s": 12.84,
+  "per_item_ms": 6420.0
+}
+```
+
+### Field reference
+
+| Field | Required | Notes |
+|---|---|---|
+| `items[]` | yes | Up to `QWEN_MAX_BATCH_ITEMS` (32). `sources[]` is accepted as an alias. |
+| `items[].id` | no | Echoed back on the result. Defaults to the audio reference itself, so results stay matchable either way. |
+| `items[].gcs_uri` | yes | The audio. Despite the name it takes an `https://` URL as readily as a `gs://` one. `url`, `audio_url`, `audio` and `audio_base64` all work too. |
+| `items[].context` | no | Must be identical across the batch, or the request is refused: a GPU pass is biased as a whole, not per clip. Prefer a request-level `prompt`. |
+| `language` | no | **Defaults to `"English"`**, not to auto-detect. See below. |
+| `prompt` | no | Request-level context biasing, same as `/transcribe`. |
+| `timestamps` | no | Word timings per result. Off by default. |
+
+### Why `language` defaults to English here
+
+`/transcribe` auto-detects when `language` is omitted. `/batch` does not: it
+defaults to `"English"`. That is deliberate and it is not a style choice.
+
+The service that first served this route hardcoded `language="English"` on every
+model call and never read the caller's field. English callers were therefore
+correct by accident and depended on that default, while every other locale was
+being transcribed as if it were English. Reading the field fixes the other
+locales; keeping the default means English callers see no change on the day the
+fix ships. Set `QWEN_BATCH_DEFAULT_LANGUAGE` to change it, or pass `language`
+explicitly, which every non-English caller should.
+
+### Failure model
+
+An item's failure costs that item and nothing else: it moves from `results` to
+`errors` under its own `id`, and the rest of the batch still returns 200. A clip
+the model never answered for also lands in `errors`, so there is always exactly
+one entry per item asked about. 400 is reserved for the whole request being
+unusable (no `items`, an item with no audio, over the item cap, conflicting
+per-item contexts).
+
+Downloads retry `QWEN_DOWNLOAD_TRIES` times (default 3) on a reset connection, a
+timeout, a 429 or a 5xx. A 403 or 404 is not retried: an expired presigned
+signature returns the same answer on every attempt.
+
+### Throughput
+
+Items are downloaded, transcoded and probed `QWEN_FETCH_WORKERS` at a time
+(default 8), then sorted by duration and pushed through the GPU in groups of
+`QWEN_GPU_BATCH_SIZE` (default 8, deployed at 32). The fetch prefix used to run
+serially and was most of a 32-item request's wall clock.
+
+---
+
 ## Long audio
 
 Qwen3-ASR processes roughly **5 minutes per forward pass** — a hard model constraint, not a tuning choice.

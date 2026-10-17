@@ -4,6 +4,7 @@ Cloud Run has no job queue — it routes HTTP requests straight at the container
 so this wraps asr_core.transcribe in the three surfaces callers actually want:
 
     POST /transcribe                  native schema (same as the RunPod input)
+    POST /batch                       many clips per request, results tagged by id
     POST /v1/audio/transcriptions     OpenAI-compatible multipart upload
     POST /runsync                     RunPod-shaped envelope, for easy migration
 
@@ -28,7 +29,10 @@ import asr_core
 
 # One GPU, one model instance. Concurrent generate() calls on the same module
 # would race on CUDA memory and give no throughput win, so inference is
-# serialized here and Cloud Run is deployed with --concurrency 1 to match.
+# serialized here. Cloud Run is deployed with a HIGHER --concurrency than this
+# on purpose: the extra requests queue at the instance rather than being
+# refused, and a caller sizing its parallelism from concurrency x max-instances
+# keeps every instance fed. See deploy/gcp/deploy.sh (CONCURRENCY vs GPU_SLOTS).
 MAX_CONCURRENCY = max(1, int(os.environ.get("QWEN_MAX_CONCURRENCY", "1")))
 _gpu_slots = threading.BoundedSemaphore(MAX_CONCURRENCY)
 
@@ -122,8 +126,8 @@ def root() -> Dict[str, Any]:
         "model": asr_core.MODEL_ID,
         "aligner": asr_core.ALIGNER_MODEL_ID if asr_core.ENABLE_ALIGNER else None,
         "ready": _state["ready"],
-        "endpoints": ["/transcribe", "/v1/audio/transcriptions", "/runsync",
-                      "/health", "/ready", "/warmup", "/docs"],
+        "endpoints": ["/transcribe", "/batch", "/v1/audio/transcriptions",
+                      "/runsync", "/health", "/ready", "/warmup", "/docs"],
     }
 
 
@@ -243,6 +247,169 @@ async def runsync_endpoint(request: Request):
         },
     )
 
+
+
+# --------------------------------------------------------------------------- #
+#                                 Batch route                                  #
+# --------------------------------------------------------------------------- #
+# The shape the annotation platform's ingest already speaks. It was serving a
+# separate 168-line Flask prototype that never lived in this repo; folding the
+# route in here is what lets the two converge on one codebase instead of
+# drifting further apart.
+#
+#   request   {"items": [{"id": "...", "gcs_uri": "https://... | gs://..."}],
+#              "language": "Italian"}
+#   response  {"results": [{"id": ..., "text": ..., "language": ...}],
+#              "errors":  [{"id": ..., "error": ...}],
+#              "n": int, "elapsed_s": float, "per_item_ms": float}
+#
+# Results carry the id they were asked about, so nothing is matched by
+# position once it leaves here.
+
+# The prototype hardcoded language="English" on every model call and never read
+# the caller's. English callers therefore depend on English being the default,
+# while every other locale was being transcribed as if it were English. Keeping
+# the default means English behaviour does not move; reading the field means
+# the other locales finally get the language they asked for.
+BATCH_DEFAULT_LANGUAGE = os.environ.get("QWEN_BATCH_DEFAULT_LANGUAGE", "English")
+
+# Where a batch item's audio may be named. "gcs_uri" first because that is what
+# the ingest sends, and despite the name it carries a presigned https URL as
+# often as a gs:// one.
+_ITEM_AUDIO_KEYS = ("gcs_uri", "url", "audio_url", "audio", "audio_base64")
+
+
+def _batch_item_source(item: Dict[str, Any], where: str) -> str:
+    for key in _ITEM_AUDIO_KEYS:
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    raise HTTPException(
+        status_code=400,
+        detail=f"{where}: need one of {', '.join(_ITEM_AUDIO_KEYS)}.",
+    )
+
+
+def _batch_prompt(items: list, payload: Dict[str, Any]) -> Optional[str]:
+    """One prompt for the whole request.
+
+    asr_core biases a forward pass, not an item, so a batch cannot carry a
+    different context per clip. Identical per-item contexts collapse to the one
+    they all agree on; differing ones are refused rather than silently applied
+    to clips that did not ask for them.
+    """
+    shared = payload.get("prompt") or payload.get("context") or payload.get("hotwords")
+    contexts = {
+        c.strip()
+        for c in (item.get("context") for item in items)
+        if isinstance(c, str) and c.strip()
+    }
+    if not contexts:
+        return shared
+    if len(contexts) > 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Per-item 'context' must be identical across a batch; a GPU "
+                   "pass is biased as a whole. Send one request-level 'prompt' "
+                   "instead, or split the batch.",
+        )
+    return contexts.pop()
+
+
+@app.post("/batch")
+async def batch_endpoint(request: Request):
+    """Transcribe many clips in one request, each result tagged with its id."""
+    _check_auth(request)
+    payload = await _read_json(request)
+    request_id = request.headers.get("x-request-id") or uuid.uuid4().hex
+
+    raw = payload.get("items")
+    if raw is None:
+        raw = payload.get("sources")
+    if not isinstance(raw, list) or not raw:
+        raise HTTPException(status_code=400, detail="items[] required")
+
+    items: list = []
+    for i, entry in enumerate(raw):
+        if isinstance(entry, str):
+            entry = {"gcs_uri": entry}
+        if not isinstance(entry, dict):
+            raise HTTPException(status_code=400, detail=f"items[{i}] must be an object or a string.")
+        items.append(entry)
+
+    sources = [_batch_item_source(it, f"items[{i}]") for i, it in enumerate(items)]
+    # Falling back to the source means a caller that sends no ids still gets
+    # results it can match up, rather than an index it has to trust.
+    ids = [
+        it["id"] if isinstance(it.get("id"), str) and it["id"].strip() else sources[i]
+        for i, it in enumerate(items)
+    ]
+
+    language = payload.get("language")
+    if language is not None and (not isinstance(language, str) or not language.strip()):
+        raise HTTPException(status_code=400, detail="'language' must be a non-empty string, or omitted.")
+
+    inner: Dict[str, Any] = {
+        "audio": sources,
+        "language": (language or BATCH_DEFAULT_LANGUAGE).strip(),
+        "timestamps": bool(payload.get("timestamps", False)),
+    }
+    prompt = _batch_prompt(items, payload)
+    if prompt:
+        inner["prompt"] = prompt
+    if payload.get("max_new_tokens") is not None:
+        inner["max_new_tokens"] = payload["max_new_tokens"]
+
+    started = time.perf_counter()
+    result = await _transcribe_async(inner, request_id)
+
+    # asr_core flattens a one-item batch into the single-item shape, so put it
+    # back into a list before anything reads results[i].
+    if "results" in result:
+        per_item = result["results"]
+    elif "error" in result:
+        # Whole-request failure: bad input, or the model never loaded. 400 keeps
+        # a caller from retrying a malformed body forever.
+        return JSONResponse(status_code=400, content={"error": result["error"]})
+    else:
+        per_item = [result]
+
+    results, errors = [], []
+    for i, item_result in enumerate(per_item):
+        item_id = ids[i] if i < len(ids) else None
+        if not isinstance(item_result, dict) or "error" in (item_result or {}):
+            errors.append({"id": item_id, "error": (item_result or {}).get("error", "no result")})
+            continue
+        row: Dict[str, Any] = {
+            "id": item_id,
+            "text": item_result.get("text", ""),
+            "language": item_result.get("language"),
+        }
+        if inner["timestamps"] and item_result.get("timestamps"):
+            row["timestamps"] = item_result["timestamps"]
+        if item_result.get("duration") is not None:
+            row["duration"] = item_result["duration"]
+        results.append(row)
+
+    # An item the model skipped entirely would otherwise vanish; the caller must
+    # see one entry per clip it asked about.
+    for missing in ids[len(per_item):]:
+        errors.append({"id": missing, "error": "internal: item produced no result"})
+
+    elapsed = time.perf_counter() - started
+    _log("INFO", "batch complete", request_id=request_id, items=len(ids),
+         ok=len(results), failed=len(errors), seconds=round(elapsed, 3),
+         language=inner["language"])
+    return JSONResponse(
+        content={
+            "results": results,
+            "errors": errors,
+            "n": len(results),
+            "elapsed_s": round(elapsed, 2),
+            "per_item_ms": round(elapsed * 1000 / max(len(ids), 1), 1),
+        },
+        headers={"x-request-id": request_id},
+    )
 
 # --------------------------------------------------------------------------- #
 #                            OpenAI-compatible route                           #

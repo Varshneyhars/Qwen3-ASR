@@ -246,7 +246,7 @@ gcloud config set project YOUR_PROJECT_ID
 
 Cloud Run GPUs exist in only six regions — `us-central1`, `us-east4`, `europe-west1`, `europe-west4`, `asia-southeast1`, and `asia-south1` (Mumbai, invitation only). Projects get 3 GPUs of quota on first deploy, so no quota request is normally needed. See [GCP.md § Prerequisites](GCP.md#prerequisites).
 
-The Cloud Run service adds three endpoints on top of the shared schema: `POST /transcribe` (native), `POST /v1/audio/transcriptions` (OpenAI-compatible file upload), and `POST /runsync` (RunPod-shaped envelope, so an existing client only changes its base URL). Cloud Run caps requests at 60 minutes — see [GCP.md § The 60-minute ceiling](GCP.md#the-60-minute-ceiling) for long audio.
+The Cloud Run service adds four endpoints on top of the shared schema: `POST /transcribe` (native), `POST /batch` (many clips per request, each result tagged with the `id` it was asked under, see [API.md § POST /batch](API.md#post-batch-cloud-run-only)), `POST /v1/audio/transcriptions` (OpenAI-compatible file upload), and `POST /runsync` (RunPod-shaped envelope, so an existing client only changes its base URL). Cloud Run caps requests at 60 minutes, so see [GCP.md § The 60-minute ceiling](GCP.md#the-60-minute-ceiling) for long audio.
 
 ## Environment Variables
 

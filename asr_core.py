@@ -16,6 +16,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -41,6 +42,15 @@ CHUNK_OVERLAP_S = float(os.environ.get("QWEN_CHUNK_OVERLAP_S", "5"))
 MAX_AUDIO_DURATION_S = float(os.environ.get("QWEN_MAX_AUDIO_DURATION_S", "14400"))
 MAX_DOWNLOAD_BYTES = int(os.environ.get("QWEN_MAX_DOWNLOAD_BYTES", str(512 * 1024 * 1024)))
 DOWNLOAD_TIMEOUT_S = float(os.environ.get("QWEN_DOWNLOAD_TIMEOUT_S", "120"))
+DOWNLOAD_TRIES = max(1, int(os.environ.get("QWEN_DOWNLOAD_TRIES", "3")))
+
+# How many batch items are fetched and transcoded at once. Every item needs a
+# download, an ffmpeg transcode and an ffprobe before the GPU sees anything, and
+# doing those one after another leaves the GPU idle for the whole prefix: at 32
+# items that was most of the request. The work is I/O and subprocesses, so
+# threads parallelise it properly despite the GIL. Matches the 8 vCPU an L4
+# instance is deployed with; set to 1 to go back to serial.
+FETCH_WORKERS = max(1, int(os.environ.get("QWEN_FETCH_WORKERS", "8")))
 MAX_BATCH_ITEMS = int(os.environ.get("QWEN_MAX_BATCH_ITEMS", "32"))
 
 # How many clips share a single GPU forward pass. Running one clip at a time
@@ -271,7 +281,45 @@ def _assert_public_host(url: str) -> None:
 
 
 def _download(url: str, dest: str) -> int:
+    """Fetch an http(s) URL to disk, retrying the failures worth retrying.
+
+    A presigned URL hitting a reset connection or a 5xx is a transient fault,
+    and without a retry it cost the item its transcript. It used to cost the
+    whole request: the prototype this replaced let the exception escape to the
+    WSGI layer, so one reset URL returned 500 for every clip in the batch.
+
+    Not retried: the size caps below (the audio will not shrink) and any other
+    4xx. An expired or revoked signature returns 403 on every attempt, so
+    retrying it only delays the error the caller needs to see.
+    """
     _assert_public_host(url)
+    last: Optional[Exception] = None
+    for attempt in range(DOWNLOAD_TRIES):
+        try:
+            return _download_once(url, dest)
+        except InputError:
+            raise
+        except (requests.ConnectionError, requests.Timeout,
+                requests.exceptions.ChunkedEncodingError) as e:
+            last = e
+        except requests.HTTPError as e:
+            status = getattr(e.response, "status_code", 0) or 0
+            if status != 429 and not 500 <= status < 600:
+                raise
+            last = e
+        if attempt < DOWNLOAD_TRIES - 1:
+            # Short, growing backoff. The caller is holding a GPU slot and the
+            # other items in this batch are waiting on the same thread pool, so
+            # this is deliberately not a long one.
+            wait = 1.5 * (2 ** attempt)
+            print(f"[download] attempt {attempt + 1}/{DOWNLOAD_TRIES} failed "
+                  f"({type(last).__name__}: {last}); retrying in {wait:.1f}s")
+            time.sleep(wait)
+    raise RuntimeError(f"Download failed after {DOWNLOAD_TRIES} attempts: "
+                       f"{type(last).__name__}: {last}")
+
+
+def _download_once(url: str, dest: str) -> int:
     written = 0
     with requests.get(
         url, stream=True, timeout=DOWNLOAD_TIMEOUT_S,
@@ -829,18 +877,37 @@ def _transcribe_grouped(req: Dict[str, Any]) -> List[Dict[str, Any]]:
     ready: List[Dict[str, Any]] = []
 
     try:
-        # ---- fetch + normalize everything first ----
-        for i, source in enumerate(req["sources"]):
+        # ---- fetch + normalize everything first, in parallel ----
+        # Serially this was the dominant cost of a large batch: 32 downloads,
+        # transcodes and duration probes, one after another, with the GPU idle
+        # throughout. Each item is independent and its failure is recorded
+        # against its own index, so nothing here depends on the order they
+        # finish in.
+        def _prepare(i: int, source: str):
             t0 = time.perf_counter()
-            try:
-                wav, duration, kind, nbytes = _materialize_audio(source, workdir, i)
-                ready.append({"idx": i, "wav": wav, "duration": duration, "kind": kind,
-                              "nbytes": nbytes, "fetch_s": time.perf_counter() - t0})
-            except InputError as e:
-                results[i] = {"error": str(e), "index": i}
-            except Exception as e:
-                print(f"[error] item {i}: {type(e).__name__}: {e}")
-                results[i] = {"error": f"{type(e).__name__}: {e}", "index": i}
+            wav, duration, kind, nbytes = _materialize_audio(source, workdir, i)
+            return {"idx": i, "wav": wav, "duration": duration, "kind": kind,
+                    "nbytes": nbytes, "fetch_s": time.perf_counter() - t0}
+
+        prepared: Dict[int, Dict[str, Any]] = {}
+        workers = min(FETCH_WORKERS, max(1, n))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="qwen-fetch") as pool:
+            futures = {
+                pool.submit(_prepare, i, source): i
+                for i, source in enumerate(req["sources"])
+            }
+            for future, i in futures.items():
+                try:
+                    prepared[i] = future.result()
+                except InputError as e:
+                    results[i] = {"error": str(e), "index": i}
+                except Exception as e:
+                    print(f"[error] item {i}: {type(e).__name__}: {e}")
+                    results[i] = {"error": f"{type(e).__name__}: {e}", "index": i}
+
+        # Rebuilt in the order asked, so a log or a tie in the duration sort
+        # below reads the same way it did when this ran serially.
+        ready = [prepared[i] for i in sorted(prepared)]
 
         short = [r for r in ready if r["duration"] <= CHUNK_THRESHOLD_S]
         long_ = [r for r in ready if r["duration"] > CHUNK_THRESHOLD_S]

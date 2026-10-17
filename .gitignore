@@ -12,6 +12,7 @@ gcp-*.json
 results.jsonl
 files.txt
 .venv/
+.venv-*/
 venv/
 .env
 .mcp.json

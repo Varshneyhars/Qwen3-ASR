@@ -452,6 +452,17 @@ def _transcode(src: str, dest: str) -> None:
         raise InputError(f"ffmpeg could not decode the audio: {stderr or '<no output>'}")
 
 
+class GpuBusy(RuntimeError):
+    """No GPU slot came free in time.
+
+    Its own type because it must never be mistaken for a bad item. The batched
+    pass falls back to one clip at a time when a group fails, on the assumption
+    that one malformed item poisoned it; doing that after a QUEUE timeout would
+    wait the full timeout again for each of up to 32 clips, turning one slow
+    request into one that cannot finish inside any sane deadline.
+    """
+
+
 @contextlib.contextmanager
 def _gpu_slot():
     """Hold a GPU slot for one forward pass.
@@ -461,7 +472,7 @@ def _gpu_slot():
     keeps the device fed instead of waiting on somebody's network.
     """
     if not _gpu_gate.acquire(timeout=GPU_QUEUE_TIMEOUT_S):
-        raise RuntimeError(
+        raise GpuBusy(
             f"GPU busy: no slot came free within {GPU_QUEUE_TIMEOUT_S:.0f}s.")
     try:
         yield
@@ -969,13 +980,23 @@ def _transcribe_grouped(req: Dict[str, Any]) -> List[Dict[str, Any]]:
         for start in range(0, len(short), GPU_BATCH_SIZE):
             group = short[start:start + GPU_BATCH_SIZE]
             t1 = time.perf_counter()
+            busy: Optional[GpuBusy] = None
             try:
                 outs = _transcribe_batch([g["wav"] for g in group], req["language"],
                                          req["prompt"], req["max_new_tokens"])
+            except GpuBusy as e:
+                # Nothing is wrong with these clips, the device is simply full.
+                # Retrying them one at a time would wait the queue timeout 32
+                # more times; report the group and move on.
+                print(f"[batch] group gave up waiting for the GPU: {e}")
+                busy, outs = e, None
             except Exception as e:
                 print(f"[batch] group failed ({type(e).__name__}: {e}); retrying individually")
                 outs = None
-            if outs is None or len(outs) != len(group):
+            if busy is not None:
+                outs = [{"language": None, "text": "", "_err": f"GpuBusy: {busy}"}
+                        for _ in group]
+            elif outs is None or len(outs) != len(group):
                 # A batched pass can fail on a single malformed item. Falling back
                 # one-by-one costs speed but saves the whole group's results.
                 outs = []

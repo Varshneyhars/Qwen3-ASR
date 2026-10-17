@@ -173,6 +173,38 @@ def test_the_gate_is_actually_around_the_forward_pass():
     assert "_get_fetch_pool()" in grouped, "the fetch pool is no longer shared"
 
 
+def test_a_queue_timeout_is_not_retried_per_clip():
+    """A full GPU must not cost one queue timeout per clip.
+
+    The group fallback retries one clip at a time, because a batched pass that
+    blows up is usually one malformed item. A GpuBusy means the opposite: the
+    clips are fine and the device is full, so retrying 32 of them would wait the
+    timeout 32 more times.
+    """
+    install_stubs()
+    calls = {"n": 0}
+    real = asr_core._transcribe_batch
+
+    def busy(paths, *a, **k):
+        calls["n"] += 1
+        raise asr_core.GpuBusy("GPU busy: no slot came free within 900s.")
+
+    asr_core._transcribe_batch = busy
+    try:
+        out = asr_core.transcribe({
+            "audio": [f"https://example.test/c-{i}.wav" for i in range(ITEMS)],
+            "language": "Italian",
+        })
+    finally:
+        asr_core._transcribe_batch = real
+
+    assert calls["n"] == 1, (
+        f"the group was retried {calls['n']} times after a queue timeout; "
+        f"it must be attempted once")
+    assert out["failed"] == ITEMS, out
+    assert all("GpuBusy" in r["error"] for r in out["results"]), out["results"][0]
+
+
 def test_fetch_pool_is_one_per_process():
     assert asr_core._get_fetch_pool() is asr_core._get_fetch_pool()
     assert asr_core._get_fetch_pool()._max_workers == asr_core.FETCH_WORKERS

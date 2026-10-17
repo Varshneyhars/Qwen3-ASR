@@ -52,7 +52,14 @@ TIMEOUT="${TIMEOUT:-3600}"             # Cloud Run's ceiling is 60 minutes
 ALLOW_UNAUTH="${ALLOW_UNAUTH:-false}"
 
 IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/${IMAGE_NAME}:${TAG}"
-SERVICE_ACCOUNT="${SERVICE_ACCOUNT_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+# A full address in SERVICE_ACCOUNT wins over SERVICE_ACCOUNT_NAME, because the
+# identity a service already runs as is not always one this script could name: a
+# service deployed by hand often runs as the default
+# PROJECT_NUMBER-compute@developer.gserviceaccount.com, which is a different
+# domain entirely. Redeploying such a service must not quietly move it onto a
+# new identity with different permissions, so pass the one it has.
+SERVICE_ACCOUNT="${SERVICE_ACCOUNT:-${SERVICE_ACCOUNT_NAME}@${PROJECT_ID}.iam.gserviceaccount.com}"
+OWN_SERVICE_ACCOUNT="${SERVICE_ACCOUNT_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 BUILD_SA="${BUILD_SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 
 if [[ -z "${PROJECT_ID}" ]]; then
@@ -82,22 +89,28 @@ gcloud artifacts repositories create "${REPO}" \
   --description "Qwen3-ASR Cloud Run images" \
   --project "${PROJECT_ID}"
 
-echo "==> Ensuring runtime service account '${SERVICE_ACCOUNT}'"
-gcloud iam service-accounts describe "${SERVICE_ACCOUNT}" --project "${PROJECT_ID}" >/dev/null 2>&1 || \
-gcloud iam service-accounts create "${SERVICE_ACCOUNT_NAME}" \
-  --display-name "Qwen3-ASR Cloud Run runtime" \
-  --project "${PROJECT_ID}"
+if [[ "${SERVICE_ACCOUNT}" != "${OWN_SERVICE_ACCOUNT}" ]]; then
+  # Somebody else's identity. Creating it or editing its roles is not this
+  # script's business, so it is used exactly as given.
+  echo "==> Runtime service account ${SERVICE_ACCOUNT} (supplied, left alone)"
+else
+  echo "==> Ensuring runtime service account '${SERVICE_ACCOUNT}'"
+  gcloud iam service-accounts describe "${SERVICE_ACCOUNT}" --project "${PROJECT_ID}" >/dev/null 2>&1 || \
+  gcloud iam service-accounts create "${SERVICE_ACCOUNT_NAME}" \
+    --display-name "Qwen3-ASR Cloud Run runtime" \
+    --project "${PROJECT_ID}"
 
-# Needed only for gs:// audio inputs, so a failure here (usually because the
-# deployer isn't a project owner) must not sink an otherwise fine deploy.
-if ! gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
-      --member "serviceAccount:${SERVICE_ACCOUNT}" \
-      --role roles/storage.objectViewer \
-      --condition=None >/dev/null 2>&1; then
-  echo "    WARNING: could not grant roles/storage.objectViewer to ${SERVICE_ACCOUNT}."
-  echo "             Everything works except gs:// audio inputs. Grant it later with:"
-  echo "               gcloud projects add-iam-policy-binding ${PROJECT_ID} \\"
-  echo "                 --member=serviceAccount:${SERVICE_ACCOUNT} --role=roles/storage.objectViewer"
+  # Needed only for gs:// audio inputs, so a failure here (usually because the
+  # deployer isn't a project owner) must not sink an otherwise fine deploy.
+  if ! gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+        --member "serviceAccount:${SERVICE_ACCOUNT}" \
+        --role roles/storage.objectViewer \
+        --condition=None >/dev/null 2>&1; then
+    echo "    WARNING: could not grant roles/storage.objectViewer to ${SERVICE_ACCOUNT}."
+    echo "             Everything works except gs:// audio inputs. Grant it later with:"
+    echo "               gcloud projects add-iam-policy-binding ${PROJECT_ID} \\"
+    echo "                 --member=serviceAccount:${SERVICE_ACCOUNT} --role=roles/storage.objectViewer"
+  fi
 fi
 
 if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
